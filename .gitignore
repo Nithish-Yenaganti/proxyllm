@@ -27,3 +27,8 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
