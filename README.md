@@ -1,3 +1,2 @@
-**AI Gateway** 
+Hi
 
-Is a self-hosted, OpenAI-compatible proxy that lets multiple applications share one set of provider API keys (OpenAI, Anthropic, etc.) through a single authenticated endpoint instead of configuring keys in every app individually. It handles virtual key issuance, request auth, streaming responses, multi-provider routing, response caching, and rate limiting, with real benchmarks for latency overhead, cache hit rate, and throughput under load. Point any app that supports a custom API base URL at this gateway instead of the provider directly — see `/docs` for setup and the API shape.
