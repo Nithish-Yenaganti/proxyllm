@@ -1,5 +1,8 @@
 """Run the authenticated OpenAI-compatible ProxyLLM HTTP API."""
 
+# Supplies the asynchronous iterator type used by the streaming response body.
+from collections.abc import AsyncIterator
+
 # Provides an asynchronous startup and shutdown context for FastAPI.
 from contextlib import asynccontextmanager
 
@@ -15,8 +18,8 @@ from dotenv import load_dotenv
 # Provides the web application, incoming request, and outgoing response types.
 from fastapi import FastAPI, Request, Response
 
-# Provides structured JSON errors for authorization and configuration failures.
-from fastapi.responses import JSONResponse
+# Provides structured JSON errors and unbuffered streaming HTTP responses.
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # Protects /v1/* routes with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
@@ -39,6 +42,99 @@ PROVIDER_CREDENTIALS = {
         "url": os.getenv("FIREWORK_URL"),
     }
 }
+
+
+# Creates one outbound HTTP client with a maximum wait between provider events.
+def create_provider_client() -> httpx.AsyncClient:
+    # A separate function lets automated tests replace the network transport safely.
+    return httpx.AsyncClient(timeout=60.0)
+
+
+# Builds the trusted headers sent to the selected real provider.
+def build_provider_headers(provider_api_key: str) -> dict[str, str]:
+    # Replaces the caller's virtual key with the server-side provider credential.
+    return {
+        "Authorization": f"Bearer {provider_api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+# Creates one stable gateway error when the provider connection cannot be opened.
+def provider_connection_error() -> JSONResponse:
+    # Uses 502 because the proxy failed while communicating with an upstream server.
+    return JSONResponse(
+        status_code=502,
+        content={
+            "error": {
+                "message": "The upstream provider could not be reached.",
+                "type": "provider_connection_error",
+                "code": "provider_unavailable",
+            }
+        },
+    )
+
+
+# Selects safe provider response headers that remain meaningful through the proxy.
+def get_provider_response_headers(
+    provider_response: httpx.Response,
+    *,
+    raw_body: bool = False,
+) -> dict[str, str]:
+    # Always gives the client the provider's content type when one is available.
+    response_headers = {
+        "Content-Type": provider_response.headers.get(
+            "content-type",
+            "application/json",
+        )
+    }
+
+    # Preserves cache instructions commonly included with SSE responses.
+    cache_control = provider_response.headers.get("cache-control")
+
+    # Adds Cache-Control only when the provider actually supplied it.
+    if cache_control is not None:
+        # Copies the provider value without exposing any credentials.
+        response_headers["Cache-Control"] = cache_control
+
+    # Preserves compression metadata only when raw, still-encoded bytes are forwarded.
+    if raw_body:
+        # Reads the encoding that the downstream client must apply to those raw bytes.
+        content_encoding = provider_response.headers.get("content-encoding")
+
+        # Adds Content-Encoding only when the provider actually compressed the body.
+        if content_encoding is not None:
+            # Keeps the raw response body and its decoding instructions consistent.
+            response_headers["Content-Encoding"] = content_encoding
+
+    # Deliberately excludes Content-Length and other connection-specific headers.
+    return response_headers
+
+
+# Yields provider bytes immediately and owns cleanup for the whole stream lifetime.
+async def stream_provider_body(
+    request: Request,
+    provider_response: httpx.Response,
+    provider_client: httpx.AsyncClient,
+) -> AsyncIterator[bytes]:
+    # Guarantees cleanup after success, provider failure, cancellation, or disconnect.
+    try:
+        # Reads each available upstream byte chunk without collecting the full answer.
+        async for chunk in provider_response.aiter_raw():
+            # Stops paying for and processing output when the calling app disconnects.
+            if await request.is_disconnected():
+                # Exits the loop so the finally block closes the upstream connection.
+                break
+
+            # Gives this chunk to FastAPI immediately for delivery to the caller.
+            yield chunk
+
+    # Runs even when Starlette cancels this generator after a client disconnect.
+    finally:
+        # Releases the provider response and its underlying network connection.
+        await provider_response.aclose()
+
+        # Releases the HTTPX client after its streamed response is finished.
+        await provider_client.aclose()
 
 
 # Performs one-time asynchronous application startup work.
@@ -114,46 +210,67 @@ async def chat_completions(request: Request):
             },
         )
 
-    # Parses the client's JSON model, messages, and generation options.
+    # Parses the client's JSON model, messages, stream flag, and generation options.
     body = await request.json()
 
-    # Opens an asynchronous client with a bounded provider wait time.
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Converts provider network failures into a stable gateway response.
-        try:
-            # Forwards the unchanged JSON while replacing the virtual key with the real key.
-            provider_response = await client.post(
-                provider_url,
-                headers={
-                    "Authorization": f"Bearer {provider_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
+    # Enables streaming only when the caller explicitly sends the JSON boolean true.
+    stream_requested = isinstance(body, dict) and body.get("stream") is True
 
-        # Handles DNS, connection, TLS, and timeout failures from httpx.
-        except httpx.RequestError:
-            # Returns 502 because the proxy could not obtain a provider response.
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": {
-                        "message": "The upstream provider could not be reached.",
-                        "type": "provider_connection_error",
-                        "code": "provider_unavailable",
-                    }
-                },
-            )
+    # Keeps Phase 2 behavior for clients and background tasks that expect one JSON body.
+    if not stream_requested:
+        # Opens a short-lived asynchronous client for the normal buffered request.
+        async with create_provider_client() as provider_client:
+            # Converts provider network failures into a stable gateway response.
+            try:
+                # Sends the unchanged JSON and waits for the complete provider response.
+                provider_response = await provider_client.post(
+                    provider_url,
+                    headers=build_provider_headers(provider_api_key),
+                    json=body,
+                )
 
-    # Reads the provider content type so compatible clients parse its body correctly.
-    provider_content_type = provider_response.headers.get(
-        "content-type",
-        "application/json",
-    )
+            # Handles DNS, connection, TLS, and timeout failures from HTTPX.
+            except httpx.RequestError:
+                # Returns one reusable sanitized error without leaking configuration.
+                return provider_connection_error()
 
-    # Returns the provider's raw body and status without exposing internal credentials.
-    return Response(
-        content=provider_response.content,
+        # Returns the provider's complete body and status for non-streaming requests.
+        return Response(
+            content=provider_response.content,
+            status_code=provider_response.status_code,
+            headers=get_provider_response_headers(provider_response),
+        )
+
+    # Keeps this client open after the route returns because streaming continues later.
+    provider_client = create_provider_client()
+
+    # Converts failures while opening the provider stream into a stable gateway response.
+    try:
+        # Builds the request separately so HTTPX can send it in streaming mode.
+        provider_request = provider_client.build_request(
+            "POST",
+            provider_url,
+            headers=build_provider_headers(provider_api_key),
+            json=body,
+        )
+
+        # Reads only provider headers now; response bytes remain unbuffered.
+        provider_response = await provider_client.send(
+            provider_request,
+            stream=True,
+        )
+
+    # Handles DNS, connection, TLS, and timeout failures before streaming begins.
+    except httpx.RequestError:
+        # Closes the manually managed client because no generator owns it yet.
+        await provider_client.aclose()
+
+        # Returns the same sanitized gateway error used by normal requests.
+        return provider_connection_error()
+
+    # Streams every provider SSE chunk with its original status and useful headers.
+    return StreamingResponse(
+        stream_provider_body(request, provider_response, provider_client),
         status_code=provider_response.status_code,
-        headers={"Content-Type": provider_content_type},
+        headers=get_provider_response_headers(provider_response, raw_body=True),
     )

@@ -4,7 +4,7 @@ This guide explains what each project file does, why it exists, and what its fun
 
 ## How the project works
 
-There are two main flows.
+There are three main flows.
 
 ### Creating a virtual key
 
@@ -40,6 +40,26 @@ Forward the request to Fireworks
 Return the Fireworks response to the client
 ```
 
+### Streaming an AI response
+
+```text
+Client sends the normal request with "stream": true
+        ↓
+Authentication and provider authorization run normally
+        ↓
+Proxy opens Fireworks with HTTPX streaming enabled
+        ↓
+Fireworks sends one Server-Sent Event chunk
+        ↓
+Proxy immediately yields the same raw bytes to the client
+        ↓
+Repeat until data: [DONE] or the client disconnects
+        ↓
+Always close the Fireworks response and HTTPX client
+```
+
+The proxy does not parse, join, or rebuild the SSE events. This preserves the provider's OpenAI-compatible streaming format and prevents the complete answer from being buffered in memory.
+
 ---
 
 ## `api/main.py`
@@ -69,6 +89,34 @@ FIREWORK_API_KEY + FIREWORK_URL
 The client never receives or directly uses the real Fireworks key.
 
 ### Functions
+
+#### `create_provider_client()`
+
+Creates the asynchronous HTTPX client used for one provider request.
+
+Keeping creation in a function makes tests able to replace real networking with an in-memory provider while production continues using a normal HTTP client.
+
+#### `build_provider_headers(provider_api_key)`
+
+Creates the outbound provider headers.
+
+It places the real server-side provider key in `Authorization: Bearer ...`; the incoming virtual key is never forwarded to Fireworks.
+
+#### `provider_connection_error()`
+
+Creates the sanitized `502 Bad Gateway` JSON response used when HTTPX cannot open a connection to Fireworks.
+
+#### `get_provider_response_headers(provider_response)`
+
+Copies response metadata that the client needs to interpret the body correctly, including `Content-Type` and `Cache-Control`. The streaming path also preserves `Content-Encoding` because it forwards raw provider bytes.
+
+It deliberately does not copy `Content-Length` or connection-specific headers because a streaming response does not have a known final length when it begins.
+
+#### `stream_provider_body(request, provider_response, provider_client)`
+
+Asynchronously loops over `provider_response.aiter_raw()` and yields each provider byte chunk immediately.
+
+Before yielding a chunk, it checks whether the calling client disconnected. Its `finally` block closes both the provider response and HTTPX client after normal completion, errors, cancellation, or disconnection.
 
 #### `lifespan(_app)`
 
@@ -105,9 +153,11 @@ It:
 1. Reads the authenticated virtual-key metadata added by middleware.
 2. Finds the provider credential that key is allowed to use.
 3. Reads the incoming OpenAI-compatible JSON body.
-4. Sends the body to Fireworks with `httpx`.
-5. Uses the real provider key from `.env`.
-6. Returns the provider's response body and status to the client.
+4. Checks whether the client explicitly sent `"stream": true`.
+5. Uses the real provider key from `.env` when sending to Fireworks.
+6. Keeps the Phase 2 complete-JSON behavior when streaming was not requested.
+7. Opens an unbuffered provider response when streaming was requested.
+8. Returns each SSE chunk immediately through `StreamingResponse`.
 
 It returns:
 
@@ -435,6 +485,39 @@ Tests HTTP authentication using an in-process FastAPI application.
 
 ---
 
+## `tests/test_streaming.py`
+
+### Purpose
+
+Tests Phase 3 without reading `.env`, spending provider credit, or opening a real network port.
+
+### Helpers
+
+#### `TrackedByteStream`
+
+Acts like a provider's asynchronous response body and records whether the proxy closed it.
+
+#### `build_route_request(body)`
+
+Builds an in-memory Starlette request and attaches the same safe provider permission metadata that authentication middleware normally supplies.
+
+#### `DisconnectedRequest`
+
+Simulates a client that has already disconnected so cleanup behavior can be verified.
+
+### Tests
+
+- SSE chunks are returned in their original order without being rewritten.
+- The final `data: [DONE]` event reaches the client.
+- `stream: true` and the rest of the JSON body reach the provider unchanged.
+- The real provider key replaces the virtual key on the outbound request.
+- Streaming response headers are preserved without adding `Content-Length`.
+- Provider response and HTTPX client resources close after completion.
+- A client disconnect stops forwarding and closes upstream resources.
+- Requests without `stream: true` retain the complete Phase 2 JSON behavior.
+
+---
+
 ## `tests/__init__.py`
 
 Marks `tests` as a Python test package.
@@ -517,3 +600,4 @@ Provides commands for initializing the database, issuing keys, running the proxy
 4. Complete keys and hashes must not appear in logs or CLI listings.
 5. Every application receives its own virtual key.
 6. Revoking one application must not affect another application.
+7. A finished, failed, cancelled, or disconnected stream must close its upstream provider resources.
