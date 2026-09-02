@@ -9,10 +9,16 @@ import unittest
 # Converts a temporary directory string into a database filesystem path.
 from pathlib import Path
 
+# Creates a Phase 2-only database fixture for migration verification.
+import aiosqlite
+
 # Supplies every database operation used during the key lifecycle.
 from auth.database import (
+    CREATE_VIRTUAL_KEYS_TABLE,
     create_virtual_key_record,
     get_active_virtual_key_by_hash,
+    get_provider_permission_for_key,
+    grant_provider_permission,
     initialize_database,
     list_virtual_key_records,
     revoke_virtual_key_record,
@@ -70,6 +76,17 @@ class VirtualKeyDatabaseTests(unittest.IsolatedAsyncioTestCase):
         # Confirms listing metadata does not contain the secret hash.
         self.assertNotIn("key_hash", records[0])
 
+        # Confirms Phase 2 provider fields migrated into the Phase 4 permission list.
+        self.assertEqual(
+            records[0]["permissions"],
+            [
+                {
+                    "provider": "fireworks",
+                    "provider_credential": "default",
+                }
+            ],
+        )
+
         # Looks up the key the same way authentication middleware will.
         active_record = await get_active_virtual_key_by_hash(
             key_hash,
@@ -84,6 +101,141 @@ class VirtualKeyDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         # Confirms the provider permission survived persistence.
         self.assertEqual(active_record["provider"], "fireworks")
+
+    # Confirms a real Phase 2 schema gains its original permission without data loss.
+    async def test_phase_two_database_is_migrated(self) -> None:
+        # Uses a second database path that initialize_database has not touched yet.
+        legacy_database_path = (
+            Path(self.temporary_directory.name) / "phase-two.db"
+        )
+
+        # Creates only the original Phase 2 virtual_keys table.
+        async with aiosqlite.connect(legacy_database_path) as database:
+            # Installs the exact legacy schema retained by the current migration.
+            await database.execute(CREATE_VIRTUAL_KEYS_TABLE)
+
+            # Inserts one realistic legacy key record with Fireworks authorization.
+            await database.execute(
+                """
+                INSERT INTO virtual_keys (
+                    app_name,
+                    key_prefix,
+                    key_hash,
+                    provider,
+                    provider_credential
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-app",
+                    "nk_legacy123",
+                    "legacy-hash",
+                    "fireworks",
+                    "default",
+                ),
+            )
+
+            # Makes the Phase 2 fixture durable before running Phase 4 migration.
+            await database.commit()
+
+        # Runs the same idempotent migration used during FastAPI startup.
+        await initialize_database(legacy_database_path)
+
+        # Looks up the automatically backfilled Fireworks permission.
+        migrated_permission = await get_provider_permission_for_key(
+            1,
+            "fireworks",
+            legacy_database_path,
+        )
+
+        # Confirms the original provider authorization survived the migration.
+        self.assertEqual(
+            migrated_permission,
+            {
+                "provider": "fireworks",
+                "provider_credential": "default",
+            },
+        )
+
+    # Confirms one active key can receive independent permissions for two providers.
+    async def test_one_key_can_use_multiple_authorized_providers(self) -> None:
+        # Generates one plaintext key that remains only in test memory.
+        virtual_key = generate_virtual_key()
+
+        # Creates the key with its initial Fireworks permission.
+        record_id = await create_virtual_key_record(
+            "multi-provider-app",
+            get_key_prefix(virtual_key),
+            hash_virtual_key(virtual_key),
+            "fireworks",
+            "default",
+            self.database_path,
+        )
+
+        # Grants the same active key permission to use Anthropic.
+        was_granted = await grant_provider_permission(
+            record_id,
+            "anthropic",
+            "default",
+            self.database_path,
+        )
+
+        # Confirms the trusted grant operation succeeded.
+        self.assertTrue(was_granted)
+
+        # Confirms model routing may resolve the original provider permission.
+        self.assertIsNotNone(
+            await get_provider_permission_for_key(
+                record_id,
+                "fireworks",
+                self.database_path,
+            )
+        )
+
+        # Confirms model routing may independently resolve the new permission.
+        anthropic_permission = await get_provider_permission_for_key(
+            record_id,
+            "anthropic",
+            self.database_path,
+        )
+        self.assertEqual(
+            anthropic_permission,
+            {
+                "provider": "anthropic",
+                "provider_credential": "default",
+            },
+        )
+
+        # Confirms an ungranted provider remains unauthorized.
+        self.assertIsNone(
+            await get_provider_permission_for_key(
+                record_id,
+                "openai",
+                self.database_path,
+            )
+        )
+
+        # Revokes the complete virtual key after its permissions are verified.
+        await revoke_virtual_key_record(record_id, self.database_path)
+
+        # Confirms revocation disables every provider permission at once.
+        self.assertIsNone(
+            await get_provider_permission_for_key(
+                record_id,
+                "anthropic",
+                self.database_path,
+            )
+        )
+
+        # Confirms a revoked key cannot receive new provider permissions.
+        self.assertFalse(
+            await grant_provider_permission(
+                record_id,
+                "openai",
+                "default",
+                self.database_path,
+            )
+        )
 
     # Confirms revoking one application does not affect another application.
     async def test_revocation_is_independent(self) -> None:

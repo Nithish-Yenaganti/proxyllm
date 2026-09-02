@@ -1,6 +1,6 @@
 """Manage virtual API keys from a trusted local terminal."""
 
-# Parses create, list, and revoke commands without adding another dependency.
+# Parses create, grant, list, and revoke commands without another dependency.
 import argparse
 
 # Runs asynchronous SQLite functions from this synchronous command-line entry point.
@@ -9,6 +9,7 @@ import asyncio
 # Supplies the database operations used by each administrator command.
 from auth.database import (
     create_virtual_key_record,
+    grant_provider_permission,
     list_virtual_key_records,
     revoke_virtual_key_record,
 )
@@ -21,7 +22,7 @@ from auth.keys import generate_virtual_key, get_key_prefix, hash_virtual_key
 def build_parser() -> argparse.ArgumentParser:
     # Creates the top-level parser and its help text.
     parser = argparse.ArgumentParser(
-        description="Create, list, and revoke ProxyLLM virtual keys."
+        description="Create, authorize, list, and revoke ProxyLLM virtual keys."
     )
 
     # Requires the caller to choose one management command.
@@ -33,11 +34,34 @@ def build_parser() -> argparse.ArgumentParser:
     # Requires a human-readable owner label such as jan or second-app.
     create_parser.add_argument("--app", required=True, help="Application name.")
 
-    # Defaults this phase to the only currently supported provider.
+    # Gives each new key one initial provider permission for immediate use.
     create_parser.add_argument(
         "--provider",
         default="fireworks",
         help="Allowed provider name.",
+    )
+
+    # Defines the command that gives an existing key another provider permission.
+    grant_parser = commands.add_parser(
+        "grant",
+        help="Grant a provider permission to an active virtual key.",
+    )
+
+    # Requires the stable key record ID displayed by the list command.
+    grant_parser.add_argument("--id", required=True, type=int, help="Key record ID.")
+
+    # Requires the exact provider registry name selected by model routing.
+    grant_parser.add_argument(
+        "--provider",
+        required=True,
+        help="Provider name to allow.",
+    )
+
+    # Selects the trusted server-side credential name for this provider.
+    grant_parser.add_argument(
+        "--credential",
+        default="default",
+        help="Allowed provider credential name.",
     )
 
     # Identifies which server-side provider credential may be resolved.
@@ -90,6 +114,33 @@ async def create_key(app_name: str, provider: str, credential: str) -> None:
     print("Save this key now; it will not be shown again.")
 
 
+# Grants an existing active virtual key access to one routed provider.
+async def grant_key_permission(
+    record_id: int,
+    provider: str,
+    credential: str,
+) -> None:
+    # Creates or updates the permission using only safe provider references.
+    was_granted = await grant_provider_permission(
+        record_id,
+        provider,
+        credential,
+    )
+
+    # Reports success for a valid active virtual key.
+    if was_granted:
+        # Identifies both the key record and the permission that now applies.
+        print(
+            f"Granted {provider}/{credential} permission to virtual key {record_id}."
+        )
+
+        # Stops after completing the selected command.
+        return
+
+    # Refuses grants for unknown or revoked keys.
+    raise SystemExit(f"No active virtual key found with ID {record_id}.")
+
+
 # Displays issued key metadata without printing secrets or hashes.
 async def list_keys() -> None:
     # Loads safe fields for every active and revoked record.
@@ -103,19 +154,27 @@ async def list_keys() -> None:
         # Stops this command after handling the empty state.
         return
 
-    # Prints one compact header for the metadata table.
-    print("ID | APP | PREFIX | PROVIDER | CREDENTIAL | ACTIVE")
+    # Prints one compact header for the key and permission metadata table.
+    print("ID | APP | PREFIX | PERMISSIONS | ACTIVE")
 
     # Visits every safe record returned by SQLite.
     for record in records:
         # Converts SQLite's integer flag into an understandable word.
         active = "yes" if record["is_active"] == 1 else "no"
 
-        # Displays only fields that cannot authenticate a request by themselves.
+        # Reads the safe permission dictionaries attached by the database layer.
+        permissions = record["permissions"]
+
+        # Builds a compact provider/credential summary for the administrator.
+        permission_summary = ", ".join(
+            f'{permission["provider"]}/{permission["provider_credential"]}'
+            for permission in permissions
+        )
+
+        # Displays only metadata that cannot authenticate a request by itself.
         print(
             f'{record["id"]} | {record["app_name"]} | '
-            f'{record["key_prefix"]}... | {record["provider"]} | '
-            f'{record["provider_credential"]} | {active}'
+            f'{record["key_prefix"]}... | {permission_summary} | {active}'
         )
 
 
@@ -142,6 +201,18 @@ async def run_command(arguments: argparse.Namespace) -> None:
     if arguments.command == "create":
         # Passes administrator-supplied ownership and permission metadata.
         await create_key(arguments.app, arguments.provider, arguments.credential)
+
+        # Stops dispatch after the selected command finishes.
+        return
+
+    # Handles additional provider authorization for an existing key.
+    if arguments.command == "grant":
+        # Passes the selected safe provider and credential references to SQLite.
+        await grant_key_permission(
+            arguments.id,
+            arguments.provider,
+            arguments.credential,
+        )
 
         # Stops dispatch after the selected command finishes.
         return

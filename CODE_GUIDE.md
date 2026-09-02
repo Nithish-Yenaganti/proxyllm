@@ -4,7 +4,7 @@ This guide explains what each project file does, why it exists, and what its fun
 
 ## How the project works
 
-There are three main flows.
+There are four main flows.
 
 ### Creating a virtual key
 
@@ -31,14 +31,32 @@ FastAPI authentication middleware
         ↓
 Hash the presented key and check SQLite
         ↓
-Resolve its permitted provider credential
+Read the requested model and select its provider adapter
         ↓
-Replace the virtual key with the real Fireworks key
+Confirm that the virtual key may use that provider
         ↓
-Forward the request to Fireworks
+Resolve the permitted real provider credential
         ↓
-Return the Fireworks response to the client
+Translate and send through Fireworks or Anthropic
+        ↓
+Return one OpenAI-compatible response to the client
 ```
+
+### Routing a model
+
+```text
+Requested model
+        ↓
+Explicit MODEL_ROUTES lookup
+        ↓
+Provider permission lookup for this virtual key
+        ↓
+Trusted credential lookup
+        ↓
+FireworksAdapter or AnthropicAdapter
+```
+
+The client selects a model, not an API key or arbitrary provider URL. The model registry controls the real provider and upstream model, while SQLite controls whether this particular virtual key is allowed to use that provider.
 
 ### Streaming an AI response
 
@@ -47,18 +65,18 @@ Client sends the normal request with "stream": true
         ↓
 Authentication and provider authorization run normally
         ↓
-Proxy opens Fireworks with HTTPX streaming enabled
+Selected adapter opens its provider with HTTPX streaming enabled
         ↓
-Fireworks sends one Server-Sent Event chunk
+Provider sends one Server-Sent Event chunk
         ↓
-Proxy immediately yields the same raw bytes to the client
+Fireworks bytes pass through unchanged, while Anthropic events are translated
         ↓
 Repeat until data: [DONE] or the client disconnects
         ↓
 Always close the Fireworks response and HTTPX client
 ```
 
-The proxy does not parse, join, or rebuild the SSE events. This preserves the provider's OpenAI-compatible streaming format and prevents the complete answer from being buffered in memory.
+The Fireworks adapter does not parse, join, or rebuild its already-compatible SSE events. The Anthropic adapter must parse named Anthropic events and emit equivalent OpenAI-compatible chunks because the two streaming schemas differ.
 
 ---
 
@@ -70,7 +88,7 @@ This is the main FastAPI application. Uvicorn imports it to start the HTTP serve
 
 ### Why we need it
 
-It connects the HTTP API, authentication middleware, provider permissions, and Fireworks forwarding logic.
+It connects the HTTP API, authentication middleware, model routing, provider permissions, credential lookup, and adapter interface.
 
 ### Important values
 
@@ -84,45 +102,25 @@ Example mapping:
 fireworks + default
         ↓
 FIREWORK_API_KEY + FIREWORK_URL
+
+anthropic + default
+        ↓
+ANTHROPIC_API_KEY + ANTHROPIC_URL
 ```
 
-The client never receives or directly uses the real Fireworks key.
+The client never receives or directly uses either real provider key.
 
 ### Functions
 
-#### `create_provider_client()`
+#### `gateway_error(status_code, message, error_type, code)`
 
-Creates the asynchronous HTTPX client used for one provider request.
-
-Keeping creation in a function makes tests able to replace real networking with an in-memory provider while production continues using a normal HTTP client.
-
-#### `build_provider_headers(provider_api_key)`
-
-Creates the outbound provider headers.
-
-It places the real server-side provider key in `Authorization: Bearer ...`; the incoming virtual key is never forwarded to Fireworks.
-
-#### `provider_connection_error()`
-
-Creates the sanitized `502 Bad Gateway` JSON response used when HTTPX cannot open a connection to Fireworks.
-
-#### `get_provider_response_headers(provider_response)`
-
-Copies response metadata that the client needs to interpret the body correctly, including `Content-Type` and `Cache-Control`. The streaming path also preserves `Content-Encoding` because it forwards raw provider bytes.
-
-It deliberately does not copy `Content-Length` or connection-specific headers because a streaming response does not have a known final length when it begins.
-
-#### `stream_provider_body(request, provider_response, provider_client)`
-
-Asynchronously loops over `provider_response.aiter_raw()` and yields each provider byte chunk immediately.
-
-Before yielding a chunk, it checks whether the calling client disconnected. Its `finally` block closes both the provider response and HTTPX client after normal completion, errors, cancellation, or disconnection.
+Creates one consistent OpenAI-compatible JSON error envelope for validation, authorization, configuration, and provider-connection failures.
 
 #### `lifespan(_app)`
 
 Runs when FastAPI starts.
 
-It calls `initialize_database()` to make sure the SQLite database and table exist before requests arrive.
+It calls `initialize_database()` to create or migrate both SQLite tables before requests arrive.
 
 #### `read_root()`
 
@@ -151,19 +149,21 @@ POST /v1/chat/completions
 It:
 
 1. Reads the authenticated virtual-key metadata added by middleware.
-2. Finds the provider credential that key is allowed to use.
-3. Reads the incoming OpenAI-compatible JSON body.
-4. Checks whether the client explicitly sent `"stream": true`.
-5. Uses the real provider key from `.env` when sending to Fireworks.
-6. Keeps the Phase 2 complete-JSON behavior when streaming was not requested.
-7. Opens an unbuffered provider response when streaming was requested.
-8. Returns each SSE chunk immediately through `StreamingResponse`.
+2. Validates the incoming JSON object and required `model` field.
+3. Finds the model in the explicit routing registry.
+4. Checks whether this key may use the routed provider.
+5. Resolves the permitted server-side credential from `.env`.
+6. Creates a provider-independent `AdapterRequest`.
+7. Calls the registered Fireworks or Anthropic adapter.
+8. Returns a complete `Response` or lazy `StreamingResponse`.
 
 It returns:
 
-- `403` when the virtual key is not allowed to use a configured provider.
+- `400` when the JSON or provider translation is invalid.
+- `403` when the virtual key is not allowed to use the routed provider.
+- `404` when the requested model is not registered.
 - `500` when the server is missing provider configuration.
-- `502` when Fireworks cannot be reached.
+- `502` when the selected provider cannot complete the request.
 
 ---
 
@@ -226,6 +226,72 @@ It lets Python use imports such as:
 ```python
 from api.middleware import VirtualKeyAuthMiddleware
 ```
+
+---
+
+## `providers/base.py`
+
+### Purpose
+
+Defines the common provider adapter interface and the data passed across that boundary.
+
+### Important types and helpers
+
+- `ProviderCredential` holds one already-authorized provider URL and real key.
+- `AdapterRequest` holds the unified body, public model, upstream model, credential, and disconnect callback.
+- `AdapterResponse` holds status, safe headers, and either complete bytes or an asynchronous byte iterator.
+- `ProviderAdapter` requires every provider implementation to expose `send(request)`.
+- `ProviderRequestError` represents a client request that cannot be translated safely.
+- `ProviderConnectionError` represents upstream connection or protocol failure.
+- `create_http_client()` creates the production HTTPX client.
+- `get_response_headers()` copies only safe meaningful provider headers.
+- `forward_raw_stream()` passes compatible SSE bytes through and always closes upstream resources.
+
+---
+
+## `providers/fireworks.py`
+
+### Purpose
+
+Implements `FireworksAdapter`, the OpenAI-compatible provider adapter.
+
+It copies the unified request, replaces the public model alias with the trusted upstream model, applies the real Fireworks Bearer key, and preserves both complete JSON and raw SSE behavior.
+
+---
+
+## `providers/anthropic.py`
+
+### Purpose
+
+Implements `AnthropicAdapter` and the translation between OpenAI chat completions and Anthropic Messages.
+
+### Main translations
+
+- `system` and `developer` messages become Anthropic's top-level `system` field.
+- User and assistant text remain conversation messages.
+- `max_tokens` and `stop` become Anthropic Messages parameters.
+- Anthropic content blocks become one OpenAI assistant message.
+- Anthropic usage and stop reasons become OpenAI-compatible fields.
+- Anthropic named streaming events become OpenAI `chat.completion.chunk` events.
+- The adapter adds `data: [DONE]` because Anthropic does not send that OpenAI marker.
+
+The current Anthropic adapter deliberately supports text chat only. It rejects tool calls and non-text content instead of silently discarding information.
+
+---
+
+## `providers/registry.py`
+
+### Purpose
+
+Contains explicit public-model routes and the registered adapter instances.
+
+`get_model_route(model)` returns the provider and trusted upstream model for one exact public name. `get_provider_adapter(provider)` returns the concrete implementation without putting provider-specific conditionals in `main.py`.
+
+---
+
+## `providers/__init__.py`
+
+Marks `providers` as a Python package.
 
 ---
 
@@ -315,6 +381,14 @@ auth/gateway.db
 
 Defines the `virtual_keys` table.
 
+#### `CREATE_PROVIDER_PERMISSIONS_TABLE`
+
+Defines `virtual_key_provider_permissions`, where each row grants one key access to one provider and named server-side credential.
+
+#### `BACKFILL_PROVIDER_PERMISSIONS`
+
+Copies every existing Phase 2 key's original provider fields into the new permission table. `INSERT OR IGNORE` makes this migration safe to run repeatedly.
+
 ### Table fields
 
 | Field | Meaning |
@@ -329,23 +403,33 @@ Defines the `virtual_keys` table.
 | `created_at` | Time the key was created |
 | `revoked_at` | Time the key was revoked, when applicable |
 
+The original `provider` columns remain for backward compatibility and migration history. Phase 4 authorization uses the separate permission table.
+
+### Provider-permission fields
+
+| Field | Meaning |
+|---|---|
+| `key_id` | Virtual key receiving the permission |
+| `provider` | Routed provider this key may use |
+| `provider_credential` | Named server-side credential the provider may resolve |
+
 ### Functions
 
 #### `initialize_database(database_path)`
 
-Creates the SQLite file and `virtual_keys` table when they do not exist.
+Creates both SQLite tables and backfills old permissions when they do not exist.
 
 It is safe to run repeatedly because the SQL uses `CREATE TABLE IF NOT EXISTS`.
 
 #### `create_virtual_key_record(...)`
 
-Inserts one key's safe metadata and hash.
+Inserts one key's safe metadata and hash together with its first provider permission.
 
 It never receives or stores the plaintext virtual key. It returns the new numeric record ID.
 
 #### `list_virtual_key_records(database_path)`
 
-Returns safe metadata for active and revoked records.
+Returns safe metadata for active and revoked records, including each key's provider-permission list.
 
 It deliberately excludes `key_hash`, so the CLI cannot accidentally display stored authentication data.
 
@@ -354,6 +438,14 @@ It deliberately excludes `key_hash`, so the CLI cannot accidentally display stor
 Finds a record only when its hash matches and `is_active` is `1`.
 
 The middleware uses this function to authenticate requests. Revoked and unknown keys both return `None`.
+
+#### `get_provider_permission_for_key(record_id, provider, database_path)`
+
+Returns the named credential only when that key is active and has an explicit permission for the provider selected by model routing.
+
+#### `grant_provider_permission(record_id, provider, provider_credential, database_path)`
+
+Adds or updates one provider permission for an active virtual key. It returns `False` for unknown or revoked keys.
 
 #### `revoke_virtual_key_record(record_id, database_path)`
 
@@ -386,6 +478,7 @@ Defines these commands and their arguments:
 
 ```bash
 python -m auth.cli create --app jan
+python -m auth.cli grant --id 1 --provider anthropic
 python -m auth.cli list
 python -m auth.cli revoke --id 1
 ```
@@ -406,6 +499,10 @@ Displays IDs, application names, prefixes, provider permissions, and active stat
 
 It never displays complete keys or hashes.
 
+#### `grant_key_permission(record_id, provider, credential)`
+
+Gives one existing active key permission to use another routed provider credential.
+
 #### `revoke_key(record_id)`
 
 Revokes one active key by its numeric database ID.
@@ -414,7 +511,7 @@ It does not affect any other application's key.
 
 #### `run_command(arguments)`
 
-Routes parsed CLI arguments to `create_key`, `list_keys`, or `revoke_key`.
+Routes parsed CLI arguments to `create_key`, `grant_key_permission`, `list_keys`, or `revoke_key`.
 
 ---
 
@@ -455,13 +552,17 @@ Tests virtual-key helpers without using the database or HTTP server.
 
 ### Purpose
 
-Tests key storage, lookup, and revocation using temporary SQLite databases.
+Tests key storage, migration, multi-provider permissions, lookup, and revocation using temporary SQLite databases.
 
 ### Tests
 
 - A hash and its metadata can be inserted and listed.
 - Safe listings do not expose `key_hash`.
 - Active hashes can be found.
+- Existing provider fields become the initial permission automatically.
+- One key can receive both Fireworks and Anthropic permissions.
+- Ungranted providers remain unavailable.
+- Revocation disables all permissions for that key.
 - Revoking one key does not revoke another key.
 
 Temporary databases protect real application records from automated tests.
@@ -489,7 +590,7 @@ Tests HTTP authentication using an in-process FastAPI application.
 
 ### Purpose
 
-Tests Phase 3 without reading `.env`, spending provider credit, or opening a real network port.
+Tests that Phase 3 Fireworks behavior remains correct after moving it behind the Phase 4 adapter.
 
 ### Helpers
 
@@ -497,13 +598,9 @@ Tests Phase 3 without reading `.env`, spending provider credit, or opening a rea
 
 Acts like a provider's asynchronous response body and records whether the proxy closed it.
 
-#### `build_route_request(body)`
+#### `DisconnectState`
 
-Builds an in-memory Starlette request and attaches the same safe provider permission metadata that authentication middleware normally supplies.
-
-#### `DisconnectedRequest`
-
-Simulates a client that has already disconnected so cleanup behavior can be verified.
+Simulates a connected or disconnected client so cleanup behavior can be verified.
 
 ### Tests
 
@@ -518,6 +615,40 @@ Simulates a client that has already disconnected so cleanup behavior can be veri
 
 ---
 
+## `tests/test_providers.py`
+
+### Purpose
+
+Tests both model adapters and all Anthropic translation without reading `.env` or contacting a real provider.
+
+### Tests
+
+- Explicit model names route to Fireworks or Anthropic.
+- Unknown names are not guessed from prefixes.
+- OpenAI system and developer messages move to Anthropic's system field.
+- Anthropic headers, request fields, text content, finish reasons, and usage are normalized.
+- Anthropic named SSE events become ordered OpenAI chunks and `data: [DONE]`.
+- Unsupported tool requests fail clearly.
+- Anthropic error envelopes become OpenAI-compatible errors.
+- Stream resources close after completion.
+
+---
+
+## `tests/test_routing.py`
+
+### Purpose
+
+Tests the real `/v1/chat/completions` route with in-memory credentials, permission lookups, and recording adapters.
+
+### Tests
+
+- The same endpoint selects Fireworks or Anthropic based on `model`.
+- The adapter receives the trusted upstream model and server-side credential.
+- Unknown models return `404` before provider work.
+- Missing provider permissions return `403`.
+
+---
+
 ## `tests/__init__.py`
 
 Marks `tests` as a Python test package.
@@ -528,11 +659,15 @@ Marks `tests` as a Python test package.
 
 ### Purpose
 
-Stores local real-provider configuration such as the Fireworks URL and API key.
+Stores local real-provider configuration such as Fireworks and Anthropic URLs and API keys.
 
 ### Security rule
 
 This file is ignored by Git and must never be committed or displayed.
+
+## `.env.example`
+
+Documents the required environment-variable names and safe endpoint examples without containing real credentials.
 
 ---
 
@@ -594,10 +729,12 @@ Provides commands for initializing the database, issuing keys, running the proxy
 
 ## Security rules to remember
 
-1. The real Fireworks key stays only in `.env`.
+1. Real Fireworks and Anthropic keys stay only in `.env`.
 2. A plaintext virtual key is displayed only once.
 3. SQLite stores only SHA-256 hashes and safe metadata.
 4. Complete keys and hashes must not appear in logs or CLI listings.
 5. Every application receives its own virtual key.
 6. Revoking one application must not affect another application.
 7. A finished, failed, cancelled, or disconnected stream must close its upstream provider resources.
+8. A model route selects a provider, but SQLite permission must authorize it before any real credential is resolved.
+9. Unsupported cross-provider features must return a clear error instead of being silently discarded.

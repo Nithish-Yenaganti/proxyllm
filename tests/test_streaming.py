@@ -1,124 +1,68 @@
-"""Verify buffered compatibility, SSE passthrough, and stream cleanup."""
+"""Verify Phase 3 Fireworks streaming still works behind its Phase 4 adapter."""
 
-# Converts Python request fixtures to the JSON bytes accepted by Starlette.
+# Parses the outbound provider request body for unchanged-payload assertions.
 import json
 
-# Supplies Python's asynchronous test framework and temporary function replacement.
+# Supplies Python's isolated asynchronous test framework.
 import unittest
-from unittest.mock import patch
 
-# Provides mock provider transports, responses, and asynchronous byte streams.
+# Provides mock HTTP transports, responses, and asynchronous byte streams.
 import httpx
 
-# Builds an HTTP-shaped request that can call the route without running Uvicorn.
-from fastapi import Request
+# Supplies the shared adapter request, credential, and stream helpers.
+from providers.base import AdapterRequest, ProviderCredential, get_response_headers
 
-# Imports the real proxy route and helpers exercised by these tests.
-from api import main
+# Supplies the OpenAI-compatible provider adapter under test.
+from providers.fireworks import FireworksAdapter
 
 
-# Represents provider bytes while recording whether cleanup closed the stream.
+# Represents provider bytes while recording consumption and cleanup.
 class TrackedByteStream(httpx.AsyncByteStream):
-    # Stores the ordered byte chunks returned by the fake provider.
+    # Stores ordered chunks and initializes observable lifecycle state.
     def __init__(self, chunks: list[bytes]) -> None:
-        # Saves a private copy so tests cannot change chunks during iteration.
+        # Copies the chunk list so external mutation cannot affect iteration.
         self.chunks = list(chunks)
 
         # Starts false and changes when HTTPX closes the response stream.
         self.was_closed = False
 
-        # Counts consumed chunks so tests can detect accidental route-level buffering.
+        # Counts consumed chunks to detect accidental buffering inside send().
         self.yield_count = 0
 
-    # Supplies provider chunks to HTTPX asynchronously and in their original order.
+    # Supplies one provider chunk at a time in its original order.
     async def __aiter__(self):
-        # Visits each configured chunk exactly once.
+        # Visits every configured chunk exactly once.
         for chunk in self.chunks:
-            # Records that downstream consumption requested another provider chunk.
+            # Records downstream demand for this provider chunk.
             self.yield_count += 1
 
-            # Makes the next provider chunk available without combining the response.
+            # Gives the raw bytes to HTTPX without joining the complete response.
             yield chunk
 
-    # Records that the response stream released its resources.
+    # Records that the provider response released its stream.
     async def aclose(self) -> None:
-        # Lets assertions prove successful and interrupted streams both clean up.
+        # Makes cleanup observable to test assertions.
         self.was_closed = True
 
 
-# Creates a direct route request containing JSON and authenticated key metadata.
-def build_route_request(body: dict[str, object]) -> Request:
-    # Encodes the same JSON bytes an OpenAI-compatible client would send over HTTP.
-    request_body = json.dumps(body).encode("utf-8")
+# Reports a configurable downstream connection state to adapter stream helpers.
+class DisconnectState:
+    # Stores whether the simulated client connection has ended.
+    def __init__(self, disconnected: bool = False) -> None:
+        # Saves the state returned by each asynchronous check.
+        self.disconnected = disconnected
 
-    # Tracks whether Starlette has already received the one request-body message.
-    body_was_sent = False
-
-    # Supplies ASGI messages when Request.json() and disconnect checks ask for them.
-    async def receive() -> dict[str, object]:
-        # Allows this closure to update the surrounding delivery state.
-        nonlocal body_was_sent
-
-        # Sends the complete JSON body on the first receive operation.
-        if not body_was_sent:
-            # Prevents the same request body from being returned twice.
-            body_was_sent = True
-
-            # Marks the body as complete because this fixture uses one ASGI message.
-            return {
-                "type": "http.request",
-                "body": request_body,
-                "more_body": False,
-            }
-
-        # Represents an open connection with no additional request-body bytes.
-        return {
-            "type": "http.request",
-            "body": b"",
-            "more_body": False,
-        }
-
-    # Describes the minimum HTTP connection information required by Starlette.
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": "/v1/chat/completions",
-        "raw_path": b"/v1/chat/completions",
-        "query_string": b"",
-        "headers": [(b"content-type", b"application/json")],
-        "client": ("test-client", 1234),
-        "server": ("test-server", 80),
-    }
-
-    # Creates the request object consumed by the real chat_completions route.
-    request = Request(scope, receive)
-
-    # Mimics the safe authorization record normally attached by middleware.
-    request.state.virtual_key = {
-        "provider": "fireworks",
-        "provider_credential": "default",
-    }
-
-    # Returns the prepared request without opening a real network port.
-    return request
+    # Matches the callback shape supplied by FastAPI Request.is_disconnected.
+    async def check(self) -> bool:
+        # Returns the current simulated connection state.
+        return self.disconnected
 
 
-# Simulates an application that disconnected before the next provider chunk arrived.
-class DisconnectedRequest:
-    # Reports the client connection state to the stream generator.
-    async def is_disconnected(self) -> bool:
-        # Forces the generator to stop before forwarding the available chunk.
-        return True
-
-
-# Exercises Phase 3 behavior without contacting Fireworks or reading real credentials.
-class StreamingProxyTests(unittest.IsolatedAsyncioTestCase):
-    # Confirms compression metadata is copied only with still-encoded raw bytes.
-    async def test_content_encoding_matches_the_forwarded_body_mode(self) -> None:
-        # Creates provider metadata representing a compressed response body.
+# Exercises Fireworks streaming without contacting a real provider.
+class FireworksStreamingTests(unittest.IsolatedAsyncioTestCase):
+    # Confirms compression metadata follows only raw, still-encoded response bodies.
+    async def test_content_encoding_matches_forwarded_body_mode(self) -> None:
+        # Creates metadata representing a compressed upstream SSE response.
         provider_response = httpx.Response(
             status_code=200,
             headers={
@@ -127,51 +71,48 @@ class StreamingProxyTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        # Builds headers for HTTPX-decoded normal content.
-        buffered_headers = main.get_provider_response_headers(provider_response)
+        # Builds headers for decoded normal content.
+        buffered_headers = get_response_headers(provider_response)
 
-        # Builds headers for raw streaming bytes that remain compressed.
-        streaming_headers = main.get_provider_response_headers(
-            provider_response,
-            raw_body=True,
-        )
+        # Builds headers for unchanged raw provider bytes.
+        streaming_headers = get_response_headers(provider_response, raw_body=True)
 
-        # Prevents a normal client from trying to decompress an already-decoded body.
+        # Prevents clients from decoding a buffered body twice.
         self.assertNotIn("Content-Encoding", buffered_headers)
 
-        # Tells a streaming client how to decode the unchanged raw provider bytes.
+        # Preserves decoding instructions for raw streamed bytes.
         self.assertEqual(streaming_headers["Content-Encoding"], "gzip")
 
-    # Confirms SSE bytes pass through unchanged and all resources close afterward.
+    # Confirms SSE chunks pass through lazily, unchanged, and with complete cleanup.
     async def test_streaming_chunks_are_forwarded_and_cleaned_up(self) -> None:
-        # Defines realistic SSE events including the OpenAI-style completion marker.
+        # Defines realistic OpenAI-compatible SSE events and completion marker.
         provider_chunks = [
             b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
             b'data: {"choices":[{"delta":{"content":" there"}}]}\n\n',
             b"data: [DONE]\n\n",
         ]
 
-        # Tracks closure of the fake provider's response body.
+        # Tracks consumption and closure of the fake provider body.
         tracked_stream = TrackedByteStream(provider_chunks)
 
-        # Captures the outbound client so the test can verify final cleanup.
+        # Captures the client so final cleanup can be asserted.
         created_clients: list[httpx.AsyncClient] = []
 
-        # Records the exact JSON body received by the fake provider.
+        # Records the exact translated provider body.
         forwarded_bodies: list[dict[str, object]] = []
 
-        # Handles the proxy's outbound request entirely in memory.
+        # Handles the adapter's outbound call entirely in memory.
         async def provider_handler(request: httpx.Request) -> httpx.Response:
-            # Confirms the proxy replaced the virtual key with the real provider key.
+            # Confirms the adapter used its authorized real provider credential.
             self.assertEqual(
                 request.headers["Authorization"],
                 "Bearer test-provider-secret",
             )
 
-            # Saves the parsed outbound body for the unchanged-payload assertion.
+            # Records the decoded outbound JSON for model and payload assertions.
             forwarded_bodies.append(json.loads(request.content))
 
-            # Returns an unbuffered SSE response from the fake provider.
+            # Returns an unbuffered provider response with standard SSE headers.
             return httpx.Response(
                 status_code=200,
                 headers={
@@ -181,167 +122,168 @@ class StreamingProxyTests(unittest.IsolatedAsyncioTestCase):
                 stream=tracked_stream,
             )
 
-        # Routes HTTPX requests to provider_handler instead of the internet.
+        # Routes HTTPX calls to the in-memory provider handler.
         transport = httpx.MockTransport(provider_handler)
 
-        # Creates the injected outbound client used by the real proxy route.
+        # Creates the injected adapter client and records its lifecycle.
         def client_factory() -> httpx.AsyncClient:
-            # Builds a normal HTTPX client around the in-memory provider transport.
+            # Builds a normal HTTPX client that cannot reach the internet.
             client = httpx.AsyncClient(transport=transport)
 
-            # Saves the instance so closure can be asserted after consumption.
+            # Saves the client for its final is_closed assertion.
             created_clients.append(client)
 
-            # Gives the proxy ownership of the client just like production code.
+            # Gives the adapter ownership of this client.
             return client
 
-        # Represents the OpenAI-compatible request sent by a streaming chat app.
-        request_body = {
-            "model": "accounts/fireworks/models/test-model",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": True,
-        }
+        # Creates the OpenAI-compatible adapter implementation under test.
+        adapter = FireworksAdapter(client_factory=client_factory)
 
-        # Uses safe in-memory configuration and replaces only outbound networking.
-        with (
-            patch.dict(
-                main.PROVIDER_CREDENTIALS,
-                {
-                    ("fireworks", "default"): {
-                        "api_key": "test-provider-secret",
-                        "url": "https://provider.test/v1/chat/completions",
-                    }
-                },
-                clear=True,
+        # Simulates a connected downstream chat client.
+        disconnect_state = DisconnectState()
+
+        # Builds the provider-independent request passed by routing code.
+        adapter_request = AdapterRequest(
+            body={
+                "model": "fireworks/public-alias",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+            public_model="fireworks/public-alias",
+            upstream_model="accounts/fireworks/models/test-model",
+            credential=ProviderCredential(
+                url="https://provider.test/v1/chat/completions",
+                api_key="test-provider-secret",
             ),
-            patch.object(main, "create_provider_client", side_effect=client_factory),
-        ):
-            # Calls the real route and receives a StreamingResponse immediately.
-            response = await main.chat_completions(build_route_request(request_body))
+            is_disconnected=disconnect_state.check,
+        )
 
-            # Proves the route returned before reading any provider response-body chunks.
-            self.assertEqual(tracked_stream.yield_count, 0)
+        # Opens the provider response and receives a lazy body iterator.
+        adapter_response = await adapter.send(adapter_request)
 
-            # Consumes individual bytes exactly as FastAPI would send them downstream.
-            received_chunks = [chunk async for chunk in response.body_iterator]
+        # Proves send() returned before consuming any generation chunk.
+        self.assertEqual(tracked_stream.yield_count, 0)
 
-        # Confirms the route selected an SSE response instead of a normal JSON response.
-        self.assertEqual(response.media_type, None)
-        self.assertEqual(response.headers["content-type"], "text/event-stream")
+        # Consumes chunks the same way FastAPI's StreamingResponse will consume them.
+        received_chunks = [chunk async for chunk in adapter_response.body]
 
-        # Confirms the proxy preserved the provider's useful streaming cache header.
-        self.assertEqual(response.headers["cache-control"], "no-cache")
+        # Confirms the adapter selected streaming with the expected safe headers.
+        self.assertTrue(adapter_response.streaming)
+        self.assertEqual(
+            adapter_response.headers["Content-Type"],
+            "text/event-stream",
+        )
+        self.assertNotIn("Content-Length", adapter_response.headers)
 
-        # Confirms no known final size was added to this streaming response.
-        self.assertNotIn("content-length", response.headers)
-
-        # Confirms every provider event reached the caller without parsing or rewriting.
+        # Confirms every event and data byte crossed the adapter unchanged.
         self.assertEqual(received_chunks, provider_chunks)
-
-        # Confirms all three events were pulled only during downstream consumption.
         self.assertEqual(tracked_stream.yield_count, len(provider_chunks))
 
-        # Confirms stream:true and every other request field reached the provider unchanged.
-        self.assertEqual(forwarded_bodies, [request_body])
+        # Confirms only the trusted upstream model replaced the public alias.
+        self.assertEqual(
+            forwarded_bodies,
+            [
+                {
+                    "model": "accounts/fireworks/models/test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True,
+                }
+            ],
+        )
 
-        # Confirms both the provider response and HTTP client released their resources.
+        # Confirms normal stream completion released both HTTPX resources.
         self.assertTrue(tracked_stream.was_closed)
         self.assertTrue(created_clients[0].is_closed)
 
-    # Confirms clients that omit stream:true keep receiving a normal complete response.
-    async def test_non_streaming_requests_keep_phase_two_behavior(self) -> None:
-        # Captures the client so context-manager cleanup can be checked.
-        created_clients: list[httpx.AsyncClient] = []
-
-        # Returns one complete JSON response from the fake provider.
-        async def provider_handler(_request: httpx.Request) -> httpx.Response:
-            # Mimics the Phase 2 chat-completions response shape.
-            return httpx.Response(
-                status_code=200,
-                json={"choices": [{"message": {"content": "complete answer"}}]},
-            )
-
-        # Routes the outbound request to the fake provider handler.
-        transport = httpx.MockTransport(provider_handler)
-
-        # Creates and records the outbound client used by the route.
-        def client_factory() -> httpx.AsyncClient:
-            # Builds the client with no external network access.
-            client = httpx.AsyncClient(transport=transport)
-
-            # Saves it for the cleanup assertion.
-            created_clients.append(client)
-
-            # Gives the route its normal client interface.
-            return client
-
-        # Omits stream:true so the original buffered response path must run.
-        request_body = {
-            "model": "accounts/fireworks/models/test-model",
-            "messages": [{"role": "user", "content": "Hello"}],
-        }
-
-        # Replaces real provider configuration and outbound networking for this test.
-        with (
-            patch.dict(
-                main.PROVIDER_CREDENTIALS,
-                {
-                    ("fireworks", "default"): {
-                        "api_key": "test-provider-secret",
-                        "url": "https://provider.test/v1/chat/completions",
-                    }
-                },
-                clear=True,
-            ),
-            patch.object(main, "create_provider_client", side_effect=client_factory),
-        ):
-            # Calls the same real route used by streaming requests.
-            response = await main.chat_completions(build_route_request(request_body))
-
-        # Confirms the complete provider JSON was returned as one normal body.
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"complete answer", response.body)
-
-        # Confirms the normal context manager still closed its HTTPX client.
-        self.assertTrue(created_clients[0].is_closed)
-
-    # Confirms disconnect detection closes upstream resources without forwarding bytes.
+    # Confirms a downstream disconnect stops forwarding and closes upstream resources.
     async def test_client_disconnect_closes_upstream_stream(self) -> None:
-        # Creates one provider chunk that should never reach a disconnected caller.
+        # Creates one chunk that must not reach an already-disconnected caller.
         tracked_stream = TrackedByteStream([b"data: should-not-be-sent\n\n"])
 
-        # Associates the response with a request so HTTPX permits raw iteration.
-        provider_response = httpx.Response(
-            status_code=200,
-            request=httpx.Request(
-                "POST",
-                "https://provider.test/v1/chat/completions",
+        # Returns that lazy stream from an in-memory provider.
+        async def provider_handler(_request: httpx.Request) -> httpx.Response:
+            # Associates standard SSE metadata with the provider stream.
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=tracked_stream,
+            )
+
+        # Prevents any real outbound network operation.
+        transport = httpx.MockTransport(provider_handler)
+
+        # Captures the manually managed provider client.
+        provider_client = httpx.AsyncClient(transport=transport)
+
+        # Creates an adapter that returns that known client.
+        adapter = FireworksAdapter(client_factory=lambda: provider_client)
+
+        # Simulates a client that disconnects before the first chunk is delivered.
+        disconnect_state = DisconnectState(disconnected=True)
+
+        # Builds one valid streaming adapter request.
+        adapter_request = AdapterRequest(
+            body={"model": "alias", "messages": [], "stream": True},
+            public_model="alias",
+            upstream_model="upstream-model",
+            credential=ProviderCredential(
+                url="https://provider.test/v1/chat/completions",
+                api_key="secret",
             ),
-            stream=tracked_stream,
+            is_disconnected=disconnect_state.check,
         )
 
-        # Creates the manually managed client owned by the stream generator.
-        provider_client = httpx.AsyncClient()
+        # Opens the lazy provider stream.
+        adapter_response = await adapter.send(adapter_request)
 
-        # Runs the real generator with a caller that reports an immediate disconnect.
-        received_chunks = [
-            chunk
-            async for chunk in main.stream_provider_body(
-                DisconnectedRequest(),
-                provider_response,
-                provider_client,
-            )
-        ]
+        # Attempts to consume output after the client is already disconnected.
+        received_chunks = [chunk async for chunk in adapter_response.body]
 
-        # Confirms no provider data was sent after the disconnect was detected.
+        # Confirms nothing was forwarded after disconnect detection.
         self.assertEqual(received_chunks, [])
 
-        # Confirms the response and client both closed despite stopping early.
+        # Confirms both upstream resources closed despite the early exit.
         self.assertTrue(tracked_stream.was_closed)
         self.assertTrue(provider_client.is_closed)
 
+    # Confirms requests without stream:true retain their complete response behavior.
+    async def test_non_streaming_requests_remain_supported(self) -> None:
+        # Returns one complete OpenAI-compatible JSON response.
+        async def provider_handler(_request: httpx.Request) -> httpx.Response:
+            # Mimics a successful complete Fireworks response.
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "complete answer"}}]},
+            )
 
-# Runs this test file directly when requested from the terminal.
+        # Creates an in-memory client for the normal adapter path.
+        adapter = FireworksAdapter(
+            client_factory=lambda: httpx.AsyncClient(
+                transport=httpx.MockTransport(provider_handler)
+            )
+        )
+
+        # Builds a request with no streaming flag.
+        adapter_request = AdapterRequest(
+            body={"model": "alias", "messages": []},
+            public_model="alias",
+            upstream_model="upstream-model",
+            credential=ProviderCredential(
+                url="https://provider.test/v1/chat/completions",
+                api_key="secret",
+            ),
+            is_disconnected=DisconnectState().check,
+        )
+
+        # Waits for the complete provider response.
+        adapter_response = await adapter.send(adapter_request)
+
+        # Confirms Phase 2 complete-response semantics still apply.
+        self.assertFalse(adapter_response.streaming)
+        self.assertIn(b"complete answer", adapter_response.body)
+
+
+# Runs this test module directly when requested from the terminal.
 if __name__ == "__main__":
-    # Starts unittest discovery and detailed failure reporting for this module.
+    # Starts unittest discovery and detailed failure reporting.
     unittest.main()

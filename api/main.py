@@ -1,276 +1,284 @@
-"""Run the authenticated OpenAI-compatible ProxyLLM HTTP API."""
+"""Run the authenticated, streaming, multi-provider ProxyLLM HTTP API."""
 
-# Supplies the asynchronous iterator type used by the streaming response body.
-from collections.abc import AsyncIterator
+# Parses incoming JSON while converting malformed bodies into stable client errors.
+import json
+
+# Reads real provider credentials and optional endpoint overrides from the environment.
+import os
 
 # Provides an asynchronous startup and shutdown context for FastAPI.
 from contextlib import asynccontextmanager
 
-# Reads provider credentials and URLs from the process environment.
-import os
-
-# Sends non-blocking outbound HTTP requests to the selected provider.
-import httpx
-
 # Loads local development variables from the ignored .env file.
 from dotenv import load_dotenv
 
-# Provides the web application, incoming request, and outgoing response types.
-from fastapi import FastAPI, Request, Response
+# Provides the web application and incoming request type.
+from fastapi import FastAPI, Request
 
-# Provides structured JSON errors and unbuffered streaming HTTP responses.
-from fastapi.responses import JSONResponse, StreamingResponse
+# Provides complete JSON responses and unbuffered streaming responses.
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# Protects /v1/* routes with active virtual API keys.
+# Protects every /v1/* route with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
 
-# Ensures the authentication database exists when the server starts.
-from auth.database import initialize_database
+# Supplies database initialization and per-provider authorization lookups.
+from auth.database import get_provider_permission_for_key, initialize_database
+
+# Supplies the provider-independent adapter request and error types.
+from providers.base import (
+    AdapterRequest,
+    ProviderConnectionError,
+    ProviderCredential,
+    ProviderRequestError,
+)
+
+# Resolves public model names and concrete provider implementations.
+from providers.registry import get_model_route, get_provider_adapter
 
 
-# Loads .env values without displaying or logging their contents.
+# Loads .env values into process memory without displaying or logging their contents.
 load_dotenv()
 
 
-# Maps a permitted database reference to the real server-side Fireworks settings.
+# Maps authorized database references to real server-side provider configuration.
 PROVIDER_CREDENTIALS = {
-    # Allows records assigned to fireworks/default to use this environment credential.
+    # Resolves Fireworks permissions created during Phase 2 and later phases.
     ("fireworks", "default"): {
-        # Reads the secret that will authenticate the outbound provider request.
+        # Reads the real Fireworks secret used only for outbound provider requests.
         "api_key": os.getenv("FIREWORK_API_KEY"),
-        # Reads the provider's chat-completions endpoint.
+        # Reads the existing Fireworks chat-completions endpoint.
         "url": os.getenv("FIREWORK_URL"),
-    }
+    },
+    # Resolves Anthropic permissions granted during Phase 4.
+    ("anthropic", "default"): {
+        # Reads the real Anthropic secret used only by the Anthropic adapter.
+        "api_key": os.getenv("ANTHROPIC_API_KEY"),
+        # Allows a custom endpoint while defaulting to Anthropic's direct Messages API.
+        "url": os.getenv(
+            "ANTHROPIC_URL",
+            "https://api.anthropic.com/v1/messages",
+        ),
+    },
 }
 
 
-# Creates one outbound HTTP client with a maximum wait between provider events.
-def create_provider_client() -> httpx.AsyncClient:
-    # A separate function lets automated tests replace the network transport safely.
-    return httpx.AsyncClient(timeout=60.0)
-
-
-# Builds the trusted headers sent to the selected real provider.
-def build_provider_headers(provider_api_key: str) -> dict[str, str]:
-    # Replaces the caller's virtual key with the server-side provider credential.
-    return {
-        "Authorization": f"Bearer {provider_api_key}",
-        "Content-Type": "application/json",
-    }
-
-
-# Creates one stable gateway error when the provider connection cannot be opened.
-def provider_connection_error() -> JSONResponse:
-    # Uses 502 because the proxy failed while communicating with an upstream server.
+# Creates one OpenAI-compatible gateway error response.
+def gateway_error(
+    status_code: int,
+    message: str,
+    error_type: str,
+    code: str,
+) -> JSONResponse:
+    # Keeps errors predictable for every OpenAI-compatible client application.
     return JSONResponse(
-        status_code=502,
+        status_code=status_code,
         content={
             "error": {
-                "message": "The upstream provider could not be reached.",
-                "type": "provider_connection_error",
-                "code": "provider_unavailable",
+                "message": message,
+                "type": error_type,
+                "code": code,
             }
         },
     )
 
 
-# Selects safe provider response headers that remain meaningful through the proxy.
-def get_provider_response_headers(
-    provider_response: httpx.Response,
-    *,
-    raw_body: bool = False,
-) -> dict[str, str]:
-    # Always gives the client the provider's content type when one is available.
-    response_headers = {
-        "Content-Type": provider_response.headers.get(
-            "content-type",
-            "application/json",
-        )
-    }
-
-    # Preserves cache instructions commonly included with SSE responses.
-    cache_control = provider_response.headers.get("cache-control")
-
-    # Adds Cache-Control only when the provider actually supplied it.
-    if cache_control is not None:
-        # Copies the provider value without exposing any credentials.
-        response_headers["Cache-Control"] = cache_control
-
-    # Preserves compression metadata only when raw, still-encoded bytes are forwarded.
-    if raw_body:
-        # Reads the encoding that the downstream client must apply to those raw bytes.
-        content_encoding = provider_response.headers.get("content-encoding")
-
-        # Adds Content-Encoding only when the provider actually compressed the body.
-        if content_encoding is not None:
-            # Keeps the raw response body and its decoding instructions consistent.
-            response_headers["Content-Encoding"] = content_encoding
-
-    # Deliberately excludes Content-Length and other connection-specific headers.
-    return response_headers
-
-
-# Yields provider bytes immediately and owns cleanup for the whole stream lifetime.
-async def stream_provider_body(
-    request: Request,
-    provider_response: httpx.Response,
-    provider_client: httpx.AsyncClient,
-) -> AsyncIterator[bytes]:
-    # Guarantees cleanup after success, provider failure, cancellation, or disconnect.
-    try:
-        # Reads each available upstream byte chunk without collecting the full answer.
-        async for chunk in provider_response.aiter_raw():
-            # Stops paying for and processing output when the calling app disconnects.
-            if await request.is_disconnected():
-                # Exits the loop so the finally block closes the upstream connection.
-                break
-
-            # Gives this chunk to FastAPI immediately for delivery to the caller.
-            yield chunk
-
-    # Runs even when Starlette cancels this generator after a client disconnect.
-    finally:
-        # Releases the provider response and its underlying network connection.
-        await provider_response.aclose()
-
-        # Releases the HTTPX client after its streamed response is finished.
-        await provider_client.aclose()
-
-
 # Performs one-time asynchronous application startup work.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Creates the SQLite file and virtual_keys table when they are missing.
+    # Creates and migrates the key and provider-permission tables when necessary.
     await initialize_database()
 
     # Hands control to FastAPI for the lifetime of the running server.
     yield
 
 
-# Creates the Uvicorn-served FastAPI application with database startup enabled.
+# Creates the Uvicorn-served application with database startup enabled.
 app = FastAPI(lifespan=lifespan)
 
-# Applies virtual-key authentication before requests reach protected routes.
+# Applies virtual-key authentication before protected routes execute.
 app.add_middleware(VirtualKeyAuthMiddleware)
 
 
 # Registers a public route that confirms the process is reachable.
 @app.get("/")
 def read_root():
-    # Returns a small JSON health response without requiring authentication.
+    # Returns a small health response without requiring authentication.
     return {"message": "Hello, World!"}
 
 
-# Accepts the OpenAI-compatible chat-completions path used by client applications.
+# Accepts the unified OpenAI-compatible endpoint used by every client application.
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    # Reads safe metadata attached by the successful authentication middleware.
+    # Reads safe key identity metadata attached by successful authentication middleware.
     virtual_key_record = request.state.virtual_key
 
-    # Builds the exact provider permission reference stored for this virtual key.
-    provider_reference = (
-        str(virtual_key_record["provider"]),
-        str(virtual_key_record["provider_credential"]),
+    # Parses the OpenAI-compatible request body before model routing begins.
+    try:
+        # Converts incoming UTF-8 JSON into ordinary Python values.
+        body = await request.json()
+
+    # Handles malformed JSON without exposing an internal FastAPI exception.
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Returns the public API's standard invalid-request response.
+        return gateway_error(
+            400,
+            "The request body must contain valid JSON.",
+            "invalid_request_error",
+            "invalid_json",
+        )
+
+    # Requires a JSON object because adapters read named request fields.
+    if not isinstance(body, dict):
+        # Rejects arrays, strings, numbers, booleans, and null before routing.
+        return gateway_error(
+            400,
+            "The request body must be a JSON object.",
+            "invalid_request_error",
+            "invalid_request_body",
+        )
+
+    # Reads the public model name that controls Phase 4 provider routing.
+    requested_model = body.get("model")
+
+    # Requires one non-empty model name before consulting the explicit registry.
+    if not isinstance(requested_model, str) or requested_model == "":
+        # Gives clients a stable validation error instead of a provider-specific failure.
+        return gateway_error(
+            400,
+            "The model field must be a non-empty string.",
+            "invalid_request_error",
+            "invalid_model",
+        )
+
+    # Resolves the provider and real model using an explicit allowlisted mapping.
+    model_route = get_model_route(requested_model)
+
+    # Rejects unknown models rather than guessing a provider from their name.
+    if model_route is None:
+        # Uses 404 because the requested gateway model does not exist.
+        return gateway_error(
+            404,
+            f"The model {requested_model!r} is not configured.",
+            "invalid_request_error",
+            "model_not_found",
+        )
+
+    # Looks up this active virtual key's permission for the routed provider.
+    provider_permission = await get_provider_permission_for_key(
+        int(virtual_key_record["id"]),
+        model_route.provider,
     )
 
-    # Resolves the permitted server-side credential without trusting client input.
+    # Rejects a valid key that lacks authorization for the selected provider.
+    if provider_permission is None:
+        # Uses 403 because authentication succeeded but provider authorization failed.
+        return gateway_error(
+            403,
+            "This virtual key cannot use the provider required by that model.",
+            "authorization_error",
+            "provider_not_allowed",
+        )
+
+    # Builds the trusted provider credential reference stored in SQLite.
+    provider_reference = (
+        model_route.provider,
+        provider_permission["provider_credential"],
+    )
+
+    # Resolves the real endpoint and API key without accepting either from the client.
     provider_config = PROVIDER_CREDENTIALS.get(provider_reference)
 
-    # Rejects a valid key that is not authorized for a configured provider credential.
+    # Rejects database permissions that have no matching server configuration.
     if provider_config is None:
-        # Uses 403 because authentication succeeded but authorization did not.
-        return JSONResponse(
-            status_code=403,
-            content={
-                "error": {
-                    "message": "This virtual key cannot use the requested provider.",
-                    "type": "authorization_error",
-                    "code": "provider_not_allowed",
-                }
-            },
+        # Reports an internal deployment mismatch without revealing credential details.
+        return gateway_error(
+            500,
+            "The authorized provider credential is not configured.",
+            "server_configuration_error",
+            "provider_not_configured",
         )
 
-    # Reads the resolved provider URL from trusted server configuration.
+    # Reads the real endpoint and secret from the trusted server configuration.
     provider_url = provider_config["url"]
-
-    # Reads the resolved real API key from trusted server configuration.
     provider_api_key = provider_config["api_key"]
 
-    # Detects incomplete server configuration before attempting an outbound call.
-    if provider_url is None or provider_api_key is None:
-        # Returns a sanitized error without exposing environment details.
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": {
-                    "message": "The authorized provider is not configured.",
-                    "type": "server_configuration_error",
-                    "code": "provider_not_configured",
-                }
-            },
+    # Detects missing or empty provider configuration before opening a connection.
+    if (
+        not isinstance(provider_url, str)
+        or provider_url == ""
+        or not isinstance(provider_api_key, str)
+        or provider_api_key == ""
+    ):
+        # Returns a sanitized error without exposing environment variable contents.
+        return gateway_error(
+            500,
+            "The authorized provider is not configured.",
+            "server_configuration_error",
+            "provider_not_configured",
         )
 
-    # Parses the client's JSON model, messages, stream flag, and generation options.
-    body = await request.json()
+    # Resolves the concrete adapter selected by the trusted model route.
+    provider_adapter = get_provider_adapter(model_route.provider)
 
-    # Enables streaming only when the caller explicitly sends the JSON boolean true.
-    stream_requested = isinstance(body, dict) and body.get("stream") is True
-
-    # Keeps Phase 2 behavior for clients and background tasks that expect one JSON body.
-    if not stream_requested:
-        # Opens a short-lived asynchronous client for the normal buffered request.
-        async with create_provider_client() as provider_client:
-            # Converts provider network failures into a stable gateway response.
-            try:
-                # Sends the unchanged JSON and waits for the complete provider response.
-                provider_response = await provider_client.post(
-                    provider_url,
-                    headers=build_provider_headers(provider_api_key),
-                    json=body,
-                )
-
-            # Handles DNS, connection, TLS, and timeout failures from HTTPX.
-            except httpx.RequestError:
-                # Returns one reusable sanitized error without leaking configuration.
-                return provider_connection_error()
-
-        # Returns the provider's complete body and status for non-streaming requests.
-        return Response(
-            content=provider_response.content,
-            status_code=provider_response.status_code,
-            headers=get_provider_response_headers(provider_response),
+    # Handles an invalid server registry without treating it as a client mistake.
+    if provider_adapter is None:
+        # Reports a deployment error without revealing internal class names.
+        return gateway_error(
+            500,
+            "The routed provider adapter is not configured.",
+            "server_configuration_error",
+            "adapter_not_configured",
         )
 
-    # Keeps this client open after the route returns because streaming continues later.
-    provider_client = create_provider_client()
+    # Packages the unified request and authorized credential for the selected adapter.
+    adapter_request = AdapterRequest(
+        body=body,
+        public_model=requested_model,
+        upstream_model=model_route.upstream_model,
+        credential=ProviderCredential(
+            url=provider_url,
+            api_key=provider_api_key,
+        ),
+        is_disconnected=request.is_disconnected,
+    )
 
-    # Converts failures while opening the provider stream into a stable gateway response.
+    # Runs provider-specific translation and HTTP work behind the shared interface.
     try:
-        # Builds the request separately so HTTPX can send it in streaming mode.
-        provider_request = provider_client.build_request(
-            "POST",
-            provider_url,
-            headers=build_provider_headers(provider_api_key),
-            json=body,
+        # Receives one provider-independent response container from either adapter.
+        adapter_response = await provider_adapter.send(adapter_request)
+
+    # Converts unsupported but well-formed translations into a client error.
+    except ProviderRequestError as error:
+        # Returns the adapter's safe explanation without exposing provider credentials.
+        return gateway_error(
+            400,
+            str(error),
+            "invalid_request_error",
+            "unsupported_request",
         )
 
-        # Reads only provider headers now; response bytes remain unbuffered.
-        provider_response = await provider_client.send(
-            provider_request,
-            stream=True,
+    # Converts DNS, TLS, connection, timeout, and invalid upstream responses to 502.
+    except ProviderConnectionError:
+        # Uses one stable message regardless of which provider failed.
+        return gateway_error(
+            502,
+            "The upstream provider could not complete the request.",
+            "provider_connection_error",
+            "provider_unavailable",
         )
 
-    # Handles DNS, connection, TLS, and timeout failures before streaming begins.
-    except httpx.RequestError:
-        # Closes the manually managed client because no generator owns it yet.
-        await provider_client.aclose()
+    # Uses FastAPI's lazy response type when the adapter returned an async byte iterator.
+    if adapter_response.streaming:
+        # Starts the downstream response before consuming the provider's full body.
+        return StreamingResponse(
+            adapter_response.body,
+            status_code=adapter_response.status_code,
+            headers=adapter_response.headers,
+        )
 
-        # Returns the same sanitized gateway error used by normal requests.
-        return provider_connection_error()
-
-    # Streams every provider SSE chunk with its original status and useful headers.
-    return StreamingResponse(
-        stream_provider_body(request, provider_response, provider_client),
-        status_code=provider_response.status_code,
-        headers=get_provider_response_headers(provider_response, raw_body=True),
+    # Returns one complete normalized or OpenAI-compatible response body.
+    return Response(
+        content=adapter_response.body,
+        status_code=adapter_response.status_code,
+        headers=adapter_response.headers,
     )
