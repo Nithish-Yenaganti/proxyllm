@@ -3,11 +3,17 @@
 # Parses incoming JSON while converting malformed bodies into stable client errors.
 import json
 
+# Reports internal logging failures without exposing them in client responses.
+import logging
+
 # Reads real provider credentials and optional endpoint overrides from the environment.
 import os
 
 # Provides an asynchronous startup and shutdown context for FastAPI.
 from contextlib import asynccontextmanager
+
+# Measures provider and streaming duration with a monotonic high-resolution clock.
+from time import perf_counter
 
 # Loads local development variables from the ignored .env file.
 from dotenv import load_dotenv
@@ -21,8 +27,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 # Protects every /v1/* route with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
 
-# Supplies database initialization and per-provider authorization lookups.
-from auth.database import get_provider_permission_for_key, initialize_database
+# Supplies database initialization, authorization lookups, and usage persistence.
+from auth.database import (
+    create_usage_log_record,
+    get_provider_permission_for_key,
+    initialize_database,
+)
 
 # Supplies the provider-independent adapter request and error types.
 from providers.base import (
@@ -32,12 +42,26 @@ from providers.base import (
     ProviderRequestError,
 )
 
-# Resolves public model names and concrete provider implementations.
-from providers.registry import get_model_route, get_provider_adapter
+# Resolves public model names, prices, and concrete provider implementations.
+from providers.registry import ModelRoute, get_model_route, get_provider_adapter
+
+# Observes usage in complete and streamed OpenAI-compatible provider responses.
+from usage.tracking import (
+    OpenAIStreamObserver,
+    StreamObservation,
+    TokenUsage,
+    estimate_cost_usd,
+    extract_token_usage_from_body,
+    observe_stream,
+)
 
 
 # Loads .env values into process memory without displaying or logging their contents.
 load_dotenv()
+
+
+# Creates this module's internal logger without printing request bodies or secrets.
+logger = logging.getLogger(__name__)
 
 
 # Maps authorized database references to real server-side provider configuration.
@@ -82,6 +106,55 @@ def gateway_error(
     )
 
 
+# Persists one safe Phase 5.1 accounting record without affecting the API response.
+async def record_request_usage(
+    virtual_key_id: int,
+    provider: str | None,
+    model: str | None,
+    model_route: ModelRoute | None,
+    usage: TokenUsage,
+    started_at: float,
+    status: str,
+    status_code: int,
+) -> None:
+    # Uses a zero estimate when validation ended before a priced model was selected.
+    estimated_cost = (
+        estimate_cost_usd(
+            usage,
+            model_route.input_cost_per_million,
+            model_route.output_cost_per_million,
+            model_route.cached_input_cost_per_million,
+        )
+        if model_route is not None
+        else 0
+    )
+
+    # Converts monotonic elapsed seconds into a readable non-negative millisecond value.
+    latency_ms = max((perf_counter() - started_at) * 1000, 0)
+
+    # Keeps observability storage failures from replacing a valid provider response.
+    try:
+        # Writes identifiers and metrics only; prompts, replies, and secrets are excluded.
+        await create_usage_log_record(
+            virtual_key_id=virtual_key_id,
+            provider=provider,
+            model=model,
+            prompt_tokens=usage.prompt_tokens,
+            cached_prompt_tokens=usage.cached_prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            estimated_cost_usd=float(estimated_cost),
+            latency_ms=latency_ms,
+            status=status,
+            status_code=status_code,
+        )
+
+    # Logs safe diagnostics locally while allowing the original request to finish.
+    except Exception:
+        # Never includes request content, virtual keys, or real provider credentials.
+        logger.exception("Unable to persist usage metrics")
+
+
 # Performs one-time asynchronous application startup work.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -109,8 +182,14 @@ def read_root():
 # Accepts the unified OpenAI-compatible endpoint used by every client application.
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # Starts latency measurement before parsing, routing, and provider work.
+    started_at = perf_counter()
+
     # Reads safe key identity metadata attached by successful authentication middleware.
     virtual_key_record = request.state.virtual_key
+
+    # Converts the authenticated key's SQLite identifier once for all log paths.
+    virtual_key_id = int(virtual_key_record["id"])
 
     # Parses the OpenAI-compatible request body before model routing begins.
     try:
@@ -119,6 +198,18 @@ async def chat_completions(request: Request):
 
     # Handles malformed JSON without exposing an internal FastAPI exception.
     except (json.JSONDecodeError, UnicodeDecodeError):
+        # Records the rejected authenticated call even though no model could be read.
+        await record_request_usage(
+            virtual_key_id,
+            None,
+            None,
+            None,
+            TokenUsage(),
+            started_at,
+            "invalid_request",
+            400,
+        )
+
         # Returns the public API's standard invalid-request response.
         return gateway_error(
             400,
@@ -129,6 +220,18 @@ async def chat_completions(request: Request):
 
     # Requires a JSON object because adapters read named request fields.
     if not isinstance(body, dict):
+        # Records a body-shape failure without storing the submitted JSON value.
+        await record_request_usage(
+            virtual_key_id,
+            None,
+            None,
+            None,
+            TokenUsage(),
+            started_at,
+            "invalid_request",
+            400,
+        )
+
         # Rejects arrays, strings, numbers, booleans, and null before routing.
         return gateway_error(
             400,
@@ -142,6 +245,18 @@ async def chat_completions(request: Request):
 
     # Requires one non-empty model name before consulting the explicit registry.
     if not isinstance(requested_model, str) or requested_model == "":
+        # Records the validation failure without treating a malformed value as a model.
+        await record_request_usage(
+            virtual_key_id,
+            None,
+            None,
+            None,
+            TokenUsage(),
+            started_at,
+            "invalid_request",
+            400,
+        )
+
         # Gives clients a stable validation error instead of a provider-specific failure.
         return gateway_error(
             400,
@@ -155,6 +270,18 @@ async def chat_completions(request: Request):
 
     # Rejects unknown models rather than guessing a provider from their name.
     if model_route is None:
+        # Records the requested public name while leaving its unknown provider empty.
+        await record_request_usage(
+            virtual_key_id,
+            None,
+            requested_model,
+            None,
+            TokenUsage(),
+            started_at,
+            "model_not_found",
+            404,
+        )
+
         # Uses 404 because the requested gateway model does not exist.
         return gateway_error(
             404,
@@ -165,12 +292,24 @@ async def chat_completions(request: Request):
 
     # Looks up this active virtual key's permission for the routed provider.
     provider_permission = await get_provider_permission_for_key(
-        int(virtual_key_record["id"]),
+        virtual_key_id,
         model_route.provider,
     )
 
     # Rejects a valid key that lacks authorization for the selected provider.
     if provider_permission is None:
+        # Records denied authorization with zero usage because no provider call occurred.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "denied",
+            403,
+        )
+
         # Uses 403 because authentication succeeded but provider authorization failed.
         return gateway_error(
             403,
@@ -190,6 +329,18 @@ async def chat_completions(request: Request):
 
     # Rejects database permissions that have no matching server configuration.
     if provider_config is None:
+        # Records the deployment mismatch before returning its sanitized server error.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "configuration_error",
+            500,
+        )
+
         # Reports an internal deployment mismatch without revealing credential details.
         return gateway_error(
             500,
@@ -209,6 +360,18 @@ async def chat_completions(request: Request):
         or not isinstance(provider_api_key, str)
         or provider_api_key == ""
     ):
+        # Records missing trusted configuration without revealing which value was absent.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "configuration_error",
+            500,
+        )
+
         # Returns a sanitized error without exposing environment variable contents.
         return gateway_error(
             500,
@@ -222,6 +385,18 @@ async def chat_completions(request: Request):
 
     # Handles an invalid server registry without treating it as a client mistake.
     if provider_adapter is None:
+        # Records the invalid server registry before returning a stable deployment error.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "configuration_error",
+            500,
+        )
+
         # Reports a deployment error without revealing internal class names.
         return gateway_error(
             500,
@@ -229,6 +404,22 @@ async def chat_completions(request: Request):
             "server_configuration_error",
             "adapter_not_configured",
         )
+
+    # Shares whether the adapter observed a downstream disconnect with the log wrapper.
+    connection_state = {"disconnected": False}
+
+    # Wraps FastAPI's check so disconnect outcomes can be classified after streaming.
+    async def track_client_disconnect() -> bool:
+        # Asks the incoming request whether its client connection has closed.
+        is_disconnected = await request.is_disconnected()
+
+        # Remembers any positive observation for the final immutable usage record.
+        if is_disconnected:
+            # A later false result cannot erase an already observed disconnect.
+            connection_state["disconnected"] = True
+
+        # Gives the adapter the same boolean used by its existing cleanup logic.
+        return is_disconnected
 
     # Packages the unified request and authorized credential for the selected adapter.
     adapter_request = AdapterRequest(
@@ -239,7 +430,7 @@ async def chat_completions(request: Request):
             url=provider_url,
             api_key=provider_api_key,
         ),
-        is_disconnected=request.is_disconnected,
+        is_disconnected=track_client_disconnect,
     )
 
     # Runs provider-specific translation and HTTP work behind the shared interface.
@@ -249,6 +440,18 @@ async def chat_completions(request: Request):
 
     # Converts unsupported but well-formed translations into a client error.
     except ProviderRequestError as error:
+        # Records translation rejection before returning the adapter's safe explanation.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "invalid_request",
+            400,
+        )
+
         # Returns the adapter's safe explanation without exposing provider credentials.
         return gateway_error(
             400,
@@ -259,6 +462,18 @@ async def chat_completions(request: Request):
 
     # Converts DNS, TLS, connection, timeout, and invalid upstream responses to 502.
     except ProviderConnectionError:
+        # Records a provider connection failure with no fabricated token usage.
+        await record_request_usage(
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            model_route,
+            TokenUsage(),
+            started_at,
+            "provider_error",
+            502,
+        )
+
         # Uses one stable message regardless of which provider failed.
         return gateway_error(
             502,
@@ -269,12 +484,85 @@ async def chat_completions(request: Request):
 
     # Uses FastAPI's lazy response type when the adapter returned an async byte iterator.
     if adapter_response.streaming:
+        # Observes normalized SSE events without delaying or changing forwarded chunks.
+        stream_observer = OpenAIStreamObserver(
+            adapter_response.headers.get("Content-Encoding")
+        )
+
+        # Converts the final stream facts into exactly one durable usage row.
+        async def finish_stream_log(
+            observation: StreamObservation,
+            stream_failed: bool,
+        ) -> None:
+            # Gives a downstream disconnect priority over generic truncation.
+            if connection_state["disconnected"]:
+                # Identifies a caller that stopped consuming tokens early.
+                stream_status = "client_disconnected"
+
+            # Identifies an exception raised while reading the provider stream.
+            elif stream_failed:
+                # Separates runtime stream failures from provider error events.
+                stream_status = "stream_error"
+
+            # Identifies an error envelope carried inside a successful SSE connection.
+            elif stream_observer.observation.provider_error:
+                # Marks the provider-generated terminal failure for reporting.
+                stream_status = "provider_error"
+
+            # Recognizes a clean OpenAI-compatible terminal marker.
+            elif stream_observer.observation.completed:
+                # Marks the fully consumed stream as successful.
+                stream_status = "success"
+
+            # Treats silent iterator exhaustion without [DONE] as truncated output.
+            else:
+                # Makes incomplete streams visible instead of counting them as success.
+                stream_status = "incomplete"
+
+            # Persists counters collected from the final usage-bearing SSE event.
+            await record_request_usage(
+                virtual_key_id,
+                model_route.provider,
+                requested_model,
+                model_route,
+                observation.usage,
+                started_at,
+                stream_status,
+                adapter_response.status_code,
+            )
+
         # Starts the downstream response before consuming the provider's full body.
         return StreamingResponse(
-            adapter_response.body,
+            observe_stream(
+                adapter_response.body,
+                stream_observer,
+                finish_stream_log,
+            ),
             status_code=adapter_response.status_code,
             headers=adapter_response.headers,
         )
+
+    # Extracts normalized token totals from the complete provider response body.
+    response_usage = extract_token_usage_from_body(adapter_response.body)
+
+    # Treats any upstream 2xx result as a completed request for accounting purposes.
+    response_status = (
+        "success"
+        if 200 <= adapter_response.status_code < 300
+        else "provider_error"
+    )
+
+    # Writes the complete-response log before returning the already-buffered body.
+    await record_request_usage(
+        virtual_key_id,
+        model_route.provider,
+        requested_model,
+        model_route,
+        response_usage,
+        started_at,
+        response_status,
+        adapter_response.status_code,
+    )
 
     # Returns one complete normalized or OpenAI-compatible response body.
     return Response(

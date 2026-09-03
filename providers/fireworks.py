@@ -47,6 +47,24 @@ class FireworksAdapter:
         # Selects streaming only for the literal JSON boolean true.
         stream_requested = provider_body.get("stream") is True
 
+        # Requests the final usage-bearing SSE event needed by Phase 5.1 accounting.
+        if stream_requested:
+            # Reads caller options only when they use the documented object shape.
+            stream_options = provider_body.get("stream_options")
+
+            # Copies existing options so the original incoming body remains untouched.
+            normalized_stream_options = (
+                dict(stream_options)
+                if isinstance(stream_options, dict)
+                else {}
+            )
+
+            # Always includes usage because gateway accounting depends on final totals.
+            normalized_stream_options["include_usage"] = True
+
+            # Sends the provider an ordinary OpenAI-compatible stream options object.
+            provider_body["stream_options"] = normalized_stream_options
+
         # Keeps the complete-response behavior used before Phase 3 and Phase 4.
         if not stream_requested:
             # Opens and automatically closes one short-lived provider client.

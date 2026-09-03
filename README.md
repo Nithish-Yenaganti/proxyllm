@@ -1,6 +1,6 @@
 # ProxyLLM
 
-ProxyLLM is a local OpenAI-compatible gateway with virtual-key authentication, SQLite provider permissions, streaming responses, and model-based routing for Fireworks and Anthropic.
+ProxyLLM is a local OpenAI-compatible gateway with virtual-key authentication, SQLite provider permissions, streaming responses, model-based routing for Fireworks and Anthropic, and per-request usage logging.
 
 ## Configure providers
 
@@ -22,6 +22,8 @@ python -m auth.database
 ```
 
 Existing Phase 2 keys automatically keep their original provider permission.
+
+The same startup migration also creates the Phase 5.1 `usage_logs` table.
 
 ## Manage virtual keys and permissions
 
@@ -90,3 +92,18 @@ python -m unittest discover -s tests -v
 ```
 
 Automated tests use temporary SQLite databases and in-memory HTTP providers, so they do not read real keys or spend provider credit.
+
+## Phase 5.1 usage logging
+
+Every authenticated chat request writes one row containing the virtual-key ID, provider, public model, prompt tokens, cached prompt tokens, completion tokens, total tokens, estimated USD cost, total latency, outcome, HTTP status, and timestamp. Prompts, generated answers, plaintext virtual keys, and real provider credentials are never stored in this table.
+
+Streaming remains unbuffered: the gateway observes a copy of each SSE chunk and writes the row only after the stream completes, fails, or disconnects. Fireworks requests automatically include `stream_options.include_usage=true`, while Anthropic's translated final event already includes normalized token usage.
+
+Until the Phase 5 reporting endpoint or CLI is added, inspect the safe ledger directly:
+
+```bash
+sqlite3 auth/gateway.db \
+  "SELECT virtual_key_id, provider, model, total_tokens, estimated_cost_usd, latency_ms, status, created_at FROM usage_logs ORDER BY id DESC;"
+```
+
+Cost estimates use standard list prices stored beside each model route: DeepSeek V4 Flash (0731) uses Fireworks' $0.22 input, $0.007 cached-input, and $0.66 output rates per million tokens; Claude Sonnet 5 uses Anthropic's $2 input and $10 output rates per million tokens. These are estimates rather than invoices, so update `providers/registry.py` when provider prices or serving tiers change.

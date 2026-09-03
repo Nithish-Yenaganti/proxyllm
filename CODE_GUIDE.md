@@ -4,7 +4,7 @@ This guide explains what each project file does, why it exists, and what its fun
 
 ## How the project works
 
-There are four main flows.
+There are five main flows.
 
 ### Creating a virtual key
 
@@ -77,6 +77,24 @@ Always close the Fireworks response and HTTPX client
 ```
 
 The Fireworks adapter does not parse, join, or rebuild its already-compatible SSE events. The Anthropic adapter must parse named Anthropic events and emit equivalent OpenAI-compatible chunks because the two streaming schemas differ.
+
+### Recording request usage
+
+```text
+Authenticated chat request enters the route
+        ↓
+Start a monotonic latency timer
+        ↓
+Route and call the selected provider normally
+        ↓
+Read usage from complete JSON or observe SSE chunks without buffering
+        ↓
+Calculate cost from the selected model route's price snapshot
+        ↓
+Insert one safe usage_logs row when the response finishes
+```
+
+Validation failures, authorization denials, configuration failures, provider errors, truncated streams, and client disconnects receive separate status values. The logger stores metrics and identifiers but never stores prompts, answers, plaintext virtual keys, or provider secrets.
 
 ---
 
@@ -255,7 +273,7 @@ Defines the common provider adapter interface and the data passed across that bo
 
 Implements `FireworksAdapter`, the OpenAI-compatible provider adapter.
 
-It copies the unified request, replaces the public model alias with the trusted upstream model, applies the real Fireworks Bearer key, and preserves both complete JSON and raw SSE behavior.
+It copies the unified request, replaces the public model alias with the trusted upstream model, applies the real Fireworks Bearer key, and preserves both complete JSON and raw SSE behavior. For streaming calls it adds `stream_options.include_usage=true` so the provider emits final token totals required by Phase 5.1.
 
 ---
 
@@ -283,7 +301,7 @@ The current Anthropic adapter deliberately supports text chat only. It rejects t
 
 ### Purpose
 
-Contains explicit public-model routes and the registered adapter instances.
+Contains explicit public-model routes, their standard per-million-token prices, and the registered adapter instances.
 
 `get_model_route(model)` returns the provider and trusted upstream model for one exact public name. `get_provider_adapter(provider)` returns the concrete implementation without putting provider-specific conditionals in `main.py`.
 
@@ -361,7 +379,7 @@ This short value helps administrators recognize a record without exposing enough
 
 ### Purpose
 
-Creates the SQLite schema and contains every database operation for virtual keys.
+Creates the SQLite schema and contains database operations for virtual keys, provider permissions, and the Phase 5.1 usage ledger.
 
 ### Why we need it
 
@@ -389,6 +407,10 @@ Defines `virtual_key_provider_permissions`, where each row grants one key access
 
 Copies every existing Phase 2 key's original provider fields into the new permission table. `INSERT OR IGNORE` makes this migration safe to run repeatedly.
 
+#### `CREATE_USAGE_LOGS_TABLE`
+
+Defines the append-only `usage_logs` accounting table linked to the virtual key that made each authenticated request.
+
 ### Table fields
 
 | Field | Meaning |
@@ -413,11 +435,28 @@ The original `provider` columns remain for backward compatibility and migration 
 | `provider` | Routed provider this key may use |
 | `provider_credential` | Named server-side credential the provider may resolve |
 
+### Usage-log fields
+
+| Field | Meaning |
+|---|---|
+| `virtual_key_id` | Safe numeric owner of the request |
+| `provider` | Routed provider, or null when routing could not finish |
+| `model` | Client-visible requested model |
+| `prompt_tokens` | Total normalized input tokens |
+| `cached_prompt_tokens` | Cached subset reported by the provider |
+| `completion_tokens` | Generated output tokens |
+| `total_tokens` | Combined input and output tokens |
+| `estimated_cost_usd` | Cost estimate calculated from that model route |
+| `latency_ms` | Route time through complete response or stream termination |
+| `status` | Searchable outcome such as `success`, `denied`, or `provider_error` |
+| `status_code` | HTTP status returned to the application |
+| `created_at` | SQLite timestamp for later daily reporting |
+
 ### Functions
 
 #### `initialize_database(database_path)`
 
-Creates both SQLite tables and backfills old permissions when they do not exist.
+Creates all SQLite tables and indexes and backfills old permissions when they do not exist.
 
 It is safe to run repeatedly because the SQL uses `CREATE TABLE IF NOT EXISTS`.
 
@@ -442,6 +481,14 @@ The middleware uses this function to authenticate requests. Revoked and unknown 
 #### `get_provider_permission_for_key(record_id, provider, database_path)`
 
 Returns the named credential only when that key is active and has an explicit permission for the provider selected by model routing.
+
+#### `create_usage_log_record(...)`
+
+Appends one completed request's safe metrics to `usage_logs` and returns its numeric log ID.
+
+#### `list_usage_log_records(database_path)`
+
+Returns usage rows in insertion order for isolated tests and the later reporting feature.
 
 #### `grant_provider_permission(record_id, provider, provider_credential, database_path)`
 
@@ -532,6 +579,27 @@ from auth.database import initialize_database
 
 ---
 
+## `usage/tracking.py`
+
+### Purpose
+
+Extracts normalized token totals, calculates model-specific cost estimates, and observes streamed SSE output without buffering or changing its bytes.
+
+### Main parts
+
+- `TokenUsage` holds prompt, cached prompt, completion, and total counters.
+- `extract_token_usage()` validates a decoded OpenAI-compatible usage object.
+- `extract_token_usage_from_body()` reads usage from a complete JSON response.
+- `estimate_cost_usd()` uses exact decimal arithmetic and per-million-token route prices.
+- `OpenAIStreamObserver` incrementally finds usage, error, and `[DONE]` events, including inside gzip or deflate streams.
+- `observe_stream()` yields every original chunk immediately and runs one final logging callback after success, failure, cancellation, or disconnect.
+
+## `usage/__init__.py`
+
+Marks Phase 5 usage utilities as an importable Python package.
+
+---
+
 ## `tests/test_keys.py`
 
 ### Purpose
@@ -606,7 +674,7 @@ Simulates a connected or disconnected client so cleanup behavior can be verified
 
 - SSE chunks are returned in their original order without being rewritten.
 - The final `data: [DONE]` event reaches the client.
-- `stream: true` and the rest of the JSON body reach the provider unchanged.
+- `stream: true` and client fields reach the provider, with `include_usage=true` added for accounting.
 - The real provider key replaces the virtual key on the outbound request.
 - Streaming response headers are preserved without adding `Content-Length`.
 - Provider response and HTTPX client resources close after completion.
@@ -646,6 +714,23 @@ Tests the real `/v1/chat/completions` route with in-memory credentials, permissi
 - The adapter receives the trusted upstream model and server-side credential.
 - Unknown models return `404` before provider work.
 - Missing provider permissions return `403`.
+- Successful, unknown-model, and denied requests invoke the isolated usage writer.
+
+---
+
+## `tests/test_usage.py`
+
+### Purpose
+
+Tests Phase 5.1 accounting without touching the real database or provider network.
+
+### Tests
+
+- Complete JSON usage and cached prompt counters are normalized.
+- Input, cached-input, and output model rates produce an exact cost estimate.
+- Arbitrarily split SSE chunks remain byte-for-byte unchanged while usage is observed.
+- Gzip SSE output remains compressed for the client while its usage copy is decoded.
+- A complete usage record survives a round trip through temporary SQLite storage.
 
 ---
 
