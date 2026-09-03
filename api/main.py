@@ -12,8 +12,11 @@ import os
 # Provides an asynchronous startup and shutdown context for FastAPI.
 from contextlib import asynccontextmanager
 
+# Preserves exact cost values while moving them between pricing and cache metadata.
+from decimal import Decimal
+
 # Measures provider and streaming duration with a monotonic high-resolution clock.
-from time import perf_counter
+from time import perf_counter, time
 
 # Loads local development variables from the ignored .env file.
 from dotenv import load_dotenv
@@ -30,8 +33,10 @@ from api.middleware import VirtualKeyAuthMiddleware
 # Supplies database initialization, authorization lookups, and usage persistence.
 from auth.database import (
     create_usage_log_record,
+    get_cached_response_record,
     get_provider_permission_for_key,
     initialize_database,
+    upsert_cached_response_record,
 )
 
 # Supplies the provider-independent adapter request and error types.
@@ -44,6 +49,9 @@ from providers.base import (
 
 # Resolves public model names, prices, and concrete provider implementations.
 from providers.registry import ModelRoute, get_model_route, get_provider_adapter
+
+# Applies safe cache eligibility, provider-field cleanup, and privacy-scoped hashing.
+from usage.cache import build_cache_key, build_provider_body, is_cache_eligible
 
 # Observes usage in complete and streamed OpenAI-compatible provider responses.
 from usage.tracking import (
@@ -62,6 +70,10 @@ load_dotenv()
 
 # Creates this module's internal logger without printing request bodies or secrets.
 logger = logging.getLogger(__name__)
+
+
+# Keeps deterministic cached responses for one hour before requiring fresh generation.
+CACHE_TTL_SECONDS = 3600
 
 
 # Maps authorized database references to real server-side provider configuration.
@@ -116,6 +128,8 @@ async def record_request_usage(
     started_at: float,
     status: str,
     status_code: int,
+    cache_status: str = "not_eligible",
+    cost_avoided_usd: Decimal = Decimal("0"),
 ) -> None:
     # Uses a zero estimate when validation ended before a priced model was selected.
     estimated_cost = (
@@ -147,12 +161,101 @@ async def record_request_usage(
             latency_ms=latency_ms,
             status=status,
             status_code=status_code,
+            cache_status=cache_status,
+            cost_avoided_usd=float(cost_avoided_usd),
         )
 
     # Logs safe diagnostics locally while allowing the original request to finish.
     except Exception:
         # Never includes request content, virtual keys, or real provider credentials.
         logger.exception("Unable to persist usage metrics")
+
+
+# Loads one cached response while allowing provider traffic if SQLite is unavailable.
+async def read_cached_response(cache_key: str) -> dict[str, object] | None:
+    # Keeps cache infrastructure optional to core provider availability.
+    try:
+        # Rejects expired rows inside the same indexed SQLite query.
+        return await get_cached_response_record(cache_key, time())
+
+    # Logs safe cache diagnostics without exposing the hashed request or its content.
+    except Exception:
+        # A cache read failure becomes a provider miss instead of an API outage.
+        logger.exception("Unable to read the response cache")
+
+        # None instructs the route to continue to the authorized provider.
+        return None
+
+
+# Stores one successful response while allowing it to reach the client on failure.
+async def write_cached_response(
+    cache_key: str,
+    virtual_key_id: int,
+    provider: str,
+    model: str,
+    response_status_code: int,
+    response_body: bytes,
+    response_headers: dict[str, str],
+    estimated_cost_usd: Decimal,
+) -> bool:
+    # Captures one timestamp so TTL duration remains exact.
+    created_at_unix = time()
+
+    # Keeps cache persistence outside the correctness path of provider responses.
+    try:
+        # Saves safe response data and the original estimated provider cost.
+        await upsert_cached_response_record(
+            cache_key=cache_key,
+            virtual_key_id=virtual_key_id,
+            provider=provider,
+            model=model,
+            response_status_code=response_status_code,
+            response_body=response_body,
+            response_headers_json=json.dumps(response_headers, sort_keys=True),
+            estimated_cost_usd=float(estimated_cost_usd),
+            created_at_unix=created_at_unix,
+            expires_at_unix=created_at_unix + CACHE_TTL_SECONDS,
+        )
+
+    # Logs safe diagnostics while preserving the successful provider response.
+    except Exception:
+        # Does not print the cache key because it is derived from request content.
+        logger.exception("Unable to write the response cache")
+
+        # Reports failure so the response header can say caching was unavailable.
+        return False
+
+    # Confirms future identical requests may reuse this response.
+    return True
+
+
+# Validates response metadata loaded from SQLite before sending it to a client.
+def decode_cached_headers(serialized_headers: object) -> dict[str, str]:
+    # Requires the cache schema's JSON text representation.
+    if not isinstance(serialized_headers, str):
+        # Falls back to the known response-body representation.
+        return {"Content-Type": "application/json"}
+
+    # Parses the stored header object while tolerating corrupted cache rows.
+    try:
+        # Converts the JSON text back into ordinary Python values.
+        decoded_headers = json.loads(serialized_headers)
+
+    # Uses a safe content type instead of failing a valid authenticated request.
+    except json.JSONDecodeError:
+        # Avoids propagating malformed internal metadata.
+        return {"Content-Type": "application/json"}
+
+    # Accepts only a flat string-to-string header mapping.
+    if not isinstance(decoded_headers, dict) or not all(
+        isinstance(name, str) and isinstance(value, str)
+        for name, value in decoded_headers.items()
+    ):
+        # Rejects arrays, nested objects, and non-string header values.
+        return {"Content-Type": "application/json"}
+
+    # Returns a copy that the route can safely add cache diagnostic headers to.
+    return dict(decoded_headers)
 
 
 # Performs one-time asynchronous application startup work.
@@ -405,6 +508,83 @@ async def chat_completions(request: Request):
             "adapter_not_configured",
         )
 
+    # Removes the gateway-only cache flag before either hashing or provider translation.
+    provider_body = build_provider_body(body)
+
+    # Allows caching only for complete responses with deterministic or explicit intent.
+    cache_eligible = is_cache_eligible(body)
+
+    # Starts with the value used by streams and non-deterministic requests.
+    cache_status = "not_eligible"
+
+    # Holds the privacy-scoped request hash only when this request may use the cache.
+    cache_key: str | None = None
+
+    # Checks persistent cached output before creating an outbound provider connection.
+    if cache_eligible:
+        # Includes the virtual-key owner to prevent cross-application response leakage.
+        cache_key = build_cache_key(virtual_key_id, provider_body)
+
+        # Reads one exact unexpired response or None for a normal miss.
+        cached_response = await read_cached_response(cache_key)
+
+        # Reuses the provider response only when all required stored fields are valid.
+        if cached_response is not None:
+            # Loads the cached response body from SQLite's BLOB representation.
+            cached_body_value = cached_response.get("response_body")
+
+            # Loads the original successful provider status code.
+            cached_status_code = cached_response.get("response_status_code")
+
+            # Requires bytes and a successful integer status before replaying the entry.
+            if (
+                isinstance(cached_body_value, bytes)
+                and isinstance(cached_status_code, int)
+                and 200 <= cached_status_code < 300
+            ):
+                # Restores only the safe response headers originally stored by the route.
+                cached_headers = decode_cached_headers(
+                    cached_response.get("response_headers_json")
+                )
+
+                # Identifies the response source for clients and benchmark tooling.
+                cached_headers["X-Proxy-Cache"] = "HIT"
+
+                # Reads the provider cost avoided by serving this stored response.
+                cost_avoided = Decimal(
+                    str(cached_response.get("estimated_cost_usd", 0))
+                )
+
+                # Exposes a safe numeric measurement without revealing request content.
+                cached_headers["X-Proxy-Cost-Avoided-USD"] = format(
+                    cost_avoided,
+                    "f",
+                )
+
+                # Records zero new provider tokens and the estimated avoided cost.
+                await record_request_usage(
+                    virtual_key_id,
+                    model_route.provider,
+                    requested_model,
+                    model_route,
+                    TokenUsage(),
+                    started_at,
+                    "success",
+                    cached_status_code,
+                    cache_status="hit",
+                    cost_avoided_usd=cost_avoided,
+                )
+
+                # Returns before adapter.send(), proving the provider was not called.
+                return Response(
+                    content=cached_body_value,
+                    status_code=cached_status_code,
+                    headers=cached_headers,
+                )
+
+        # Marks every usable but absent, expired, or invalid entry as a provider miss.
+        cache_status = "miss"
+
     # Shares whether the adapter observed a downstream disconnect with the log wrapper.
     connection_state = {"disconnected": False}
 
@@ -423,7 +603,7 @@ async def chat_completions(request: Request):
 
     # Packages the unified request and authorized credential for the selected adapter.
     adapter_request = AdapterRequest(
-        body=body,
+        body=provider_body,
         public_model=requested_model,
         upstream_model=model_route.upstream_model,
         credential=ProviderCredential(
@@ -450,6 +630,7 @@ async def chat_completions(request: Request):
             started_at,
             "invalid_request",
             400,
+            cache_status=cache_status,
         )
 
         # Returns the adapter's safe explanation without exposing provider credentials.
@@ -472,6 +653,7 @@ async def chat_completions(request: Request):
             started_at,
             "provider_error",
             502,
+            cache_status=cache_status,
         )
 
         # Uses one stable message regardless of which provider failed.
@@ -529,6 +711,7 @@ async def chat_completions(request: Request):
                 started_at,
                 stream_status,
                 adapter_response.status_code,
+                cache_status=cache_status,
             )
 
         # Starts the downstream response before consuming the provider's full body.
@@ -552,6 +735,51 @@ async def chat_completions(request: Request):
         else "provider_error"
     )
 
+    # Calculates the cost once for cache storage and safe diagnostic headers.
+    response_cost = estimate_cost_usd(
+        response_usage,
+        model_route.input_cost_per_million,
+        model_route.output_cost_per_million,
+        model_route.cached_input_cost_per_million,
+    )
+
+    # Copies adapter headers before adding gateway-owned cache diagnostics.
+    response_headers = dict(adapter_response.headers)
+
+    # Makes cache behavior directly measurable by clients and workload scripts.
+    response_headers["X-Proxy-Cache"] = (
+        "MISS" if cache_status == "miss" else "BYPASS"
+    )
+
+    # Exposes the estimated provider spend for this newly completed request.
+    response_headers["X-Proxy-Estimated-Cost-USD"] = format(
+        response_cost,
+        "f",
+    )
+
+    # Stores only successful eligible responses after their complete body is available.
+    if (
+        cache_key is not None
+        and 200 <= adapter_response.status_code < 300
+        and isinstance(adapter_response.body, bytes)
+    ):
+        # Persists the response for this app and exact normalized request until TTL expiry.
+        cache_written = await write_cached_response(
+            cache_key,
+            virtual_key_id,
+            model_route.provider,
+            requested_model,
+            adapter_response.status_code,
+            adapter_response.body,
+            adapter_response.headers,
+            response_cost,
+        )
+
+        # Distinguishes a normal miss from cache infrastructure that could not store it.
+        if not cache_written:
+            # Reports the degraded cache path while preserving the provider response.
+            response_headers["X-Proxy-Cache"] = "ERROR"
+
     # Writes the complete-response log before returning the already-buffered body.
     await record_request_usage(
         virtual_key_id,
@@ -562,11 +790,12 @@ async def chat_completions(request: Request):
         started_at,
         response_status,
         adapter_response.status_code,
+        cache_status=cache_status,
     )
 
     # Returns one complete normalized or OpenAI-compatible response body.
     return Response(
         content=adapter_response.body,
         status_code=adapter_response.status_code,
-        headers=adapter_response.headers,
+        headers=response_headers,
     )

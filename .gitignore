@@ -18,6 +18,9 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Local benchmark evidence can contain machine, endpoint, and workload details
+benchmarks/results/*.json
+
 # Packaging and build output
 build/
 dist/
@@ -30,5 +33,11 @@ dist/
 
 # Local databases
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

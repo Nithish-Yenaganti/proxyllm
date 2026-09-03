@@ -18,15 +18,26 @@ from providers.base import AdapterRequest, AdapterResponse
 
 
 # Builds one authenticated in-memory request for the real chat route.
-def build_chat_request(model: str, *, stream: bool = False) -> Request:
+def build_chat_request(
+    model: str,
+    *,
+    stream: bool = False,
+    extra_body: dict[str, object] | None = None,
+) -> Request:
     # Creates the unified JSON body sent by an OpenAI-compatible client.
-    request_body = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": stream,
-        }
-    ).encode("utf-8")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": stream,
+    }
+
+    # Adds cache controls or other test-specific request parameters when supplied.
+    if extra_body is not None:
+        # Updates only this isolated request fixture.
+        body.update(extra_body)
+
+    # Encodes the complete fixture as the ASGI request body.
+    request_body = json.dumps(body).encode("utf-8")
 
     # Tracks whether Starlette already consumed the request body.
     body_was_sent = False
@@ -371,6 +382,152 @@ class MultiProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log_fields["completion_tokens"], 5)
         self.assertEqual(log_fields["total_tokens"], 15)
         self.assertEqual(log_fields["status"], "success")
+
+    # Confirms an authorized cache hit returns before any provider adapter call.
+    async def test_cache_hit_skips_provider_and_logs_avoided_cost(self) -> None:
+        # Supplies the provider permission that must still be checked before caching.
+        permission_lookup = AsyncMock(
+            return_value={
+                "provider": "fireworks",
+                "provider_credential": "default",
+            }
+        )
+
+        # Uses a recording adapter so an unexpected provider call is visible.
+        adapter = RecordingAdapter("fireworks")
+
+        # Represents one valid unexpired SQLite cache record.
+        cached_response = {
+            "response_status_code": 200,
+            "response_body": b'{"choices":[{"message":{"content":"cached"}}]}',
+            "response_headers_json": '{"Content-Type":"application/json"}',
+            "estimated_cost_usd": 0.0000042,
+        }
+
+        # Replaces all external and database dependencies for this cache-hit request.
+        with (
+            patch.dict(
+                main.PROVIDER_CREDENTIALS,
+                {
+                    ("fireworks", "default"): {
+                        "url": "https://fireworks.test/api",
+                        "api_key": "test-provider-secret",
+                    }
+                },
+                clear=True,
+            ),
+            patch.object(
+                main,
+                "get_provider_permission_for_key",
+                permission_lookup,
+            ),
+            patch.object(
+                main,
+                "get_provider_adapter",
+                return_value=adapter,
+            ),
+            patch.object(
+                main,
+                "read_cached_response",
+                AsyncMock(return_value=cached_response),
+            ),
+        ):
+            # Explicitly opts this non-streaming request into response caching.
+            response = await main.chat_completions(
+                build_chat_request(
+                    "fireworks/deepseek-v4-flash",
+                    extra_body={"cache": True},
+                )
+            )
+
+        # Confirms the stored provider response is returned with measurable metadata.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-proxy-cache"], "HIT")
+        self.assertEqual(
+            response.headers["x-proxy-cost-avoided-usd"],
+            "0.0000042",
+        )
+
+        # Proves no outbound adapter request was made on the cache hit.
+        self.assertIsNone(adapter.received_request)
+
+        # Confirms the hit and avoided cost reached usage logging.
+        self.usage_log_writer.assert_awaited_once()
+        log_fields = self.usage_log_writer.await_args.kwargs
+        self.assertEqual(log_fields["cache_status"], "hit")
+        self.assertEqual(log_fields["cost_avoided_usd"], 0.0000042)
+
+    # Confirms a cache miss calls the provider and stores its successful response.
+    async def test_cache_miss_calls_provider_and_stores_response(self) -> None:
+        # Supplies valid authorization for the deterministic Fireworks request.
+        permission_lookup = AsyncMock(
+            return_value={
+                "provider": "fireworks",
+                "provider_credential": "default",
+            }
+        )
+
+        # Returns one complete response through the normal adapter contract.
+        adapter = RecordingAdapter("fireworks")
+
+        # Records whether the new response would be written into SQLite.
+        cache_writer = AsyncMock(return_value=True)
+
+        # Simulates an empty cache and prevents all real I/O.
+        with (
+            patch.dict(
+                main.PROVIDER_CREDENTIALS,
+                {
+                    ("fireworks", "default"): {
+                        "url": "https://fireworks.test/api",
+                        "api_key": "test-provider-secret",
+                    }
+                },
+                clear=True,
+            ),
+            patch.object(
+                main,
+                "get_provider_permission_for_key",
+                permission_lookup,
+            ),
+            patch.object(
+                main,
+                "get_provider_adapter",
+                return_value=adapter,
+            ),
+            patch.object(
+                main,
+                "read_cached_response",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(main, "write_cached_response", cache_writer),
+        ):
+            # Uses temperature zero to select automatic deterministic caching.
+            response = await main.chat_completions(
+                build_chat_request(
+                    "fireworks/deepseek-v4-flash",
+                    extra_body={"temperature": 0},
+                )
+            )
+
+        # Confirms a miss returns the provider response and exposes its source.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-proxy-cache"], "MISS")
+
+        # Confirms the adapter received the request but not a private cache field.
+        self.assertIsNotNone(adapter.received_request)
+        assert adapter.received_request is not None
+        self.assertNotIn("cache", adapter.received_request.body)
+
+        # Confirms the completed provider response was offered to persistent storage.
+        cache_writer.assert_awaited_once()
+
+        # Confirms usage reporting classifies the provider call as a miss.
+        self.usage_log_writer.assert_awaited_once()
+        self.assertEqual(
+            self.usage_log_writer.await_args.kwargs["cache_status"],
+            "miss",
+        )
 
 
 # Runs this test module directly when requested from the terminal.

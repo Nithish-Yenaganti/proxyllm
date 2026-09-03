@@ -94,9 +94,37 @@ CREATE TABLE IF NOT EXISTS usage_logs (
     latency_ms REAL NOT NULL CHECK (latency_ms >= 0),
     status TEXT NOT NULL,
     status_code INTEGER NOT NULL,
+    cache_status TEXT NOT NULL DEFAULT 'not_eligible',
+    cost_avoided_usd REAL NOT NULL DEFAULT 0
+        CHECK (cost_avoided_usd >= 0),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (virtual_key_id) REFERENCES virtual_keys(id)
 )
+"""
+
+
+# Stores complete successful responses for deterministic, non-streaming requests.
+CREATE_RESPONSE_CACHE_TABLE = """
+CREATE TABLE IF NOT EXISTS response_cache (
+    cache_key TEXT PRIMARY KEY,
+    virtual_key_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    response_status_code INTEGER NOT NULL,
+    response_body BLOB NOT NULL,
+    response_headers_json TEXT NOT NULL,
+    estimated_cost_usd REAL NOT NULL CHECK (estimated_cost_usd >= 0),
+    created_at_unix REAL NOT NULL,
+    expires_at_unix REAL NOT NULL,
+    FOREIGN KEY (virtual_key_id) REFERENCES virtual_keys(id) ON DELETE CASCADE
+)
+"""
+
+
+# Makes per-app cache cleanup and expiry maintenance efficient.
+CREATE_RESPONSE_CACHE_EXPIRY_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_response_cache_expiry
+ON response_cache (virtual_key_id, expires_at_unix)
 """
 
 
@@ -107,10 +135,52 @@ ON usage_logs (virtual_key_id, created_at)
 """
 
 
+# Applies safety and concurrency settings to each newly opened SQLite connection.
+async def configure_database_connection(database: aiosqlite.Connection) -> None:
+    # Enforces key ownership relationships instead of accepting orphan rows.
+    await database.execute("PRAGMA foreign_keys = ON")
+
+    # Waits briefly for another request's write transaction instead of failing at once.
+    await database.execute("PRAGMA busy_timeout = 5000")
+
+
+# Adds one migration column only when an older database does not contain it.
+async def add_column_if_missing(
+    database: aiosqlite.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    # Reads SQLite's trusted schema metadata for the fixed internal table name.
+    cursor = await database.execute(f"PRAGMA table_info({table_name})")
+
+    # Collects every existing column name before deciding whether to migrate.
+    existing_columns = {row[1] for row in await cursor.fetchall()}
+
+    # Releases the schema cursor after its small result set has been read.
+    await cursor.close()
+
+    # Leaves current databases unchanged when the column already exists.
+    if column_name in existing_columns:
+        # Makes repeated application startups idempotent.
+        return
+
+    # Applies a fixed developer-controlled definition, never client-supplied SQL.
+    await database.execute(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+    )
+
+
 # Creates the database file and schema without returning a value.
 async def initialize_database(database_path: Path = DATABASE_PATH) -> None:
     # Opens the SQLite connection and closes it automatically afterward.
     async with aiosqlite.connect(database_path) as database:
+        # Applies foreign-key enforcement and a concurrency-friendly lock timeout.
+        await configure_database_connection(database)
+
+        # Enables concurrent readers while one request appends a log or cache record.
+        await database.execute("PRAGMA journal_mode = WAL")
+
         # Creates virtual_keys only when it does not already exist.
         await database.execute(CREATE_VIRTUAL_KEYS_TABLE)
 
@@ -123,8 +193,30 @@ async def initialize_database(database_path: Path = DATABASE_PATH) -> None:
         # Creates Phase 5.1 request accounting without changing existing key records.
         await database.execute(CREATE_USAGE_LOGS_TABLE)
 
+        # Adds Phase 5.2 cache metadata to databases created before caching existed.
+        await add_column_if_missing(
+            database,
+            "usage_logs",
+            "cache_status",
+            "TEXT NOT NULL DEFAULT 'not_eligible'",
+        )
+
+        # Adds avoided-cost accounting without rewriting historical usage rows.
+        await add_column_if_missing(
+            database,
+            "usage_logs",
+            "cost_avoided_usd",
+            "REAL NOT NULL DEFAULT 0 CHECK (cost_avoided_usd >= 0)",
+        )
+
+        # Creates the persistent per-application response cache when missing.
+        await database.execute(CREATE_RESPONSE_CACHE_TABLE)
+
         # Adds the reporting index only when it has not already been created.
         await database.execute(CREATE_USAGE_LOGS_KEY_DATE_INDEX)
+
+        # Adds the cache expiry lookup index once for future request hot paths.
+        await database.execute(CREATE_RESPONSE_CACHE_EXPIRY_INDEX)
 
         # Permanently saves the schema change to the database file.
         await database.commit()
@@ -293,11 +385,11 @@ async def get_active_virtual_key_by_hash(
     key_hash: str,
     database_path: Path = DATABASE_PATH,
 ) -> dict[str, object] | None:
-    # Ensures authentication also works on the first server startup.
-    await initialize_database(database_path)
-
     # Opens a read connection for this authentication attempt.
     async with aiosqlite.connect(database_path) as database:
+        # Uses startup-created schema and waits safely around concurrent writes.
+        await configure_database_connection(database)
+
         # Makes the selected row accessible by descriptive column names.
         database.row_factory = aiosqlite.Row
 
@@ -342,13 +434,15 @@ async def create_usage_log_record(
     latency_ms: float,
     status: str,
     status_code: int,
+    cache_status: str = "not_eligible",
+    cost_avoided_usd: float = 0,
     database_path: Path = DATABASE_PATH,
 ) -> int:
-    # Ensures upgraded and fresh installations both contain the usage table.
-    await initialize_database(database_path)
-
     # Opens one short-lived write connection for this completed request.
     async with aiosqlite.connect(database_path) as database:
+        # Waits safely when another concurrent request is writing to SQLite.
+        await configure_database_connection(database)
+
         # Inserts normalized metrics and safe identifiers without request content or keys.
         cursor = await database.execute(
             """
@@ -363,9 +457,11 @@ async def create_usage_log_record(
                 estimated_cost_usd,
                 latency_ms,
                 status,
-                status_code
+                status_code,
+                cache_status,
+                cost_avoided_usd
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 virtual_key_id,
@@ -379,6 +475,8 @@ async def create_usage_log_record(
                 latency_ms,
                 status,
                 status_code,
+                cache_status,
+                cost_avoided_usd,
             ),
         )
 
@@ -428,6 +526,8 @@ async def list_usage_log_records(
                 latency_ms,
                 status,
                 status_code,
+                cache_status,
+                cost_avoided_usd,
                 created_at
             FROM usage_logs
             ORDER BY id
@@ -444,17 +544,127 @@ async def list_usage_log_records(
     return [dict(row) for row in rows]
 
 
+# Returns one unexpired cached response for an exact per-application cache key.
+async def get_cached_response_record(
+    cache_key: str,
+    current_time_unix: float,
+    database_path: Path = DATABASE_PATH,
+) -> dict[str, object] | None:
+    # Opens one short-lived read connection on the initialized application database.
+    async with aiosqlite.connect(database_path) as database:
+        # Applies the same concurrency and relationship settings as request writes.
+        await configure_database_connection(database)
+
+        # Makes the optional cache row accessible by descriptive names.
+        database.row_factory = aiosqlite.Row
+
+        # Requires both an exact key match and a future expiry timestamp.
+        cursor = await database.execute(
+            """
+            SELECT
+                cache_key,
+                virtual_key_id,
+                provider,
+                model,
+                response_status_code,
+                response_body,
+                response_headers_json,
+                estimated_cost_usd,
+                created_at_unix,
+                expires_at_unix
+            FROM response_cache
+            WHERE cache_key = ? AND expires_at_unix > ?
+            LIMIT 1
+            """,
+            (cache_key, current_time_unix),
+        )
+
+        # Reads the cached response or None when it is missing or expired.
+        row = await cursor.fetchone()
+
+        # Releases the lookup cursor after the single-row read.
+        await cursor.close()
+
+    # Returns an ordinary dictionary without exposing SQLite row objects upstream.
+    return dict(row) if row is not None else None
+
+
+# Creates or refreshes one successful deterministic response cache entry.
+async def upsert_cached_response_record(
+    cache_key: str,
+    virtual_key_id: int,
+    provider: str,
+    model: str,
+    response_status_code: int,
+    response_body: bytes,
+    response_headers_json: str,
+    estimated_cost_usd: float,
+    created_at_unix: float,
+    expires_at_unix: float,
+    database_path: Path = DATABASE_PATH,
+) -> None:
+    # Opens one bounded write connection for this cacheable provider response.
+    async with aiosqlite.connect(database_path) as database:
+        # Waits for concurrent usage-log writes instead of failing immediately.
+        await configure_database_connection(database)
+
+        # Inserts a new value or atomically refreshes the same normalized request key.
+        cursor = await database.execute(
+            """
+            INSERT INTO response_cache (
+                cache_key,
+                virtual_key_id,
+                provider,
+                model,
+                response_status_code,
+                response_body,
+                response_headers_json,
+                estimated_cost_usd,
+                created_at_unix,
+                expires_at_unix
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (cache_key)
+            DO UPDATE SET
+                response_status_code = excluded.response_status_code,
+                response_body = excluded.response_body,
+                response_headers_json = excluded.response_headers_json,
+                estimated_cost_usd = excluded.estimated_cost_usd,
+                created_at_unix = excluded.created_at_unix,
+                expires_at_unix = excluded.expires_at_unix
+            """,
+            (
+                cache_key,
+                virtual_key_id,
+                provider,
+                model,
+                response_status_code,
+                response_body,
+                response_headers_json,
+                estimated_cost_usd,
+                created_at_unix,
+                expires_at_unix,
+            ),
+        )
+
+        # Makes the response available to later gateway requests immediately.
+        await database.commit()
+
+        # Releases the cache write cursor after the transaction commits.
+        await cursor.close()
+
+
 # Finds the credential permission an active virtual key has for one routed provider.
 async def get_provider_permission_for_key(
     record_id: int,
     provider: str,
     database_path: Path = DATABASE_PATH,
 ) -> dict[str, str] | None:
-    # Ensures existing Phase 2 databases are migrated before authorization runs.
-    await initialize_database(database_path)
-
     # Opens a short-lived connection for this provider authorization check.
     async with aiosqlite.connect(database_path) as database:
+        # Uses startup-created schema and waits safely around concurrent writes.
+        await configure_database_connection(database)
+
         # Makes the matching permission accessible by column name.
         database.row_factory = aiosqlite.Row
 

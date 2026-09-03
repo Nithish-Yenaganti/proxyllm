@@ -13,10 +13,15 @@ from decimal import Decimal
 # Creates an isolated SQLite path for each persistence test.
 from pathlib import Path
 
+# Creates a pre-cache usage schema for migration verification.
+import aiosqlite
+
 # Supplies the virtual-key and usage database operations under test.
 from auth.database import (
+    CREATE_VIRTUAL_KEYS_TABLE,
     create_usage_log_record,
     create_virtual_key_record,
+    initialize_database,
     list_usage_log_records,
 )
 
@@ -217,6 +222,8 @@ class UsageDatabaseTests(unittest.IsolatedAsyncioTestCase):
             latency_ms=123.45,
             status="success",
             status_code=200,
+            cache_status="miss",
+            cost_avoided_usd=0.0,
             database_path=self.database_path,
         )
 
@@ -235,6 +242,60 @@ class UsageDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["latency_ms"], 123.45)
         self.assertEqual(records[0]["status"], "success")
         self.assertEqual(records[0]["status_code"], 200)
+        self.assertEqual(records[0]["cache_status"], "miss")
+        self.assertEqual(records[0]["cost_avoided_usd"], 0)
+
+    # Confirms Phase 5.1 databases gain cache metrics without losing old logs.
+    async def test_pre_cache_usage_table_is_migrated(self) -> None:
+        # Uses a separate database that current initialization has never touched.
+        legacy_path = Path(self.temporary_directory.name) / "pre-cache.db"
+
+        # Creates the exact required parent table and previous usage schema.
+        async with aiosqlite.connect(legacy_path) as database:
+            # Installs the virtual key owner table required by current migrations.
+            await database.execute(CREATE_VIRTUAL_KEYS_TABLE)
+
+            # Installs the Phase 5 usage table from before cache columns existed.
+            await database.execute(
+                """
+                CREATE TABLE usage_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    virtual_key_id INTEGER NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    latency_ms REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    status_code INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # Makes the legacy schema durable before exercising startup migration.
+            await database.commit()
+
+        # Runs the same idempotent migration used by the real FastAPI lifespan.
+        await initialize_database(legacy_path)
+
+        # Reads the upgraded column names directly from SQLite metadata.
+        async with aiosqlite.connect(legacy_path) as database:
+            # Queries the trusted internal table schema.
+            cursor = await database.execute("PRAGMA table_info(usage_logs)")
+
+            # Collects only descriptive column names for the assertions.
+            columns = {row[1] for row in await cursor.fetchall()}
+
+            # Releases the schema cursor after reading its result.
+            await cursor.close()
+
+        # Confirms both new accounting fields were added safely.
+        self.assertIn("cache_status", columns)
+        self.assertIn("cost_avoided_usd", columns)
 
 
 # Runs this test module directly with detailed unittest output when requested.
