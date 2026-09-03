@@ -1,10 +1,86 @@
 # ProxyLLM
 
-ProxyLLM is a local OpenAI-compatible gateway with virtual-key authentication, SQLite provider permissions, streaming responses, model-based routing for Fireworks and Anthropic, and per-request usage logging.
+ProxyLLM is a self-hosted, OpenAI-compatible gateway for applications that use multiple large language model (LLM) providers. An application sends one familiar `/v1/chat/completions` request to ProxyLLM, and the gateway authenticates it, selects the configured provider, forwards the request, and returns a consistent response.
 
-## Configure providers
+## What does it do?
 
-Copy the variable names from `.env.example` into your ignored `.env` and fill in only the credentials you intend to use.
+ProxyLLM provides one controlled entry point for Fireworks and Anthropic models. It includes:
+
+- virtual API keys, so applications never receive the real provider credentials;
+- per-key provider permissions, stored in SQLite;
+- model-based routing through one OpenAI-compatible endpoint;
+- normal and Server-Sent Events (SSE) streaming responses;
+- usage, cost, latency, and outcome logging without storing prompts or answers;
+- an optional one-hour cache for deterministic non-streaming requests; and
+- benchmark tools for measuring gateway overhead, cache savings, and load behavior.
+
+## Why does it exist?
+
+Using provider APIs directly becomes difficult when several applications, developers, or models share the same credentials. Provider-specific request formats spread into client code, credentials become harder to rotate safely, access is difficult to revoke per application, and usage is fragmented across services.
+
+ProxyLLM puts those concerns in one local gateway. Clients use a stable API and a revocable virtual key, while the gateway owns provider credentials, routing rules, permissions, and measurement.
+
+## How is it helpful?
+
+- **Safer credential management:** real Fireworks and Anthropic keys remain on the gateway.
+- **Simpler client integration:** OpenAI-compatible clients can use one base URL while switching models through the `model` field.
+- **Fine-grained access:** each virtual key can be granted or denied access to individual providers.
+- **Easier provider changes:** routing and provider-specific translation stay in the gateway instead of every client.
+- **Useful cost visibility:** each request records tokens, estimated cost, latency, cache status, and outcome.
+- **Lower repeated-request cost:** eligible deterministic responses can be reused within the same virtual-key boundary.
+- **Measurable performance:** included benchmarks help validate overhead, cache effectiveness, and supported load.
+
+## Who is it for?
+
+ProxyLLM is useful for:
+
+- developers running local tools or AI applications against more than one provider;
+- small teams that need separate, revocable credentials for each application;
+- platform engineers evaluating a lightweight LLM gateway architecture;
+- projects that need provider-independent streaming and response formats; and
+- engineers who want request-level usage and cost estimates without retaining user content.
+
+It is currently best suited to local development, prototypes, portfolio projects, and controlled internal deployments. It is not yet a complete production gateway: it has no provider fallback, distributed cache, high-availability database, management API, or built-in rate limiting.
+
+## How it works
+
+```text
+OpenAI-compatible client
+        |
+        | Bearer virtual-key + requested model
+        v
+ProxyLLM authentication and permission check
+        |
+        | model route + server-side provider credential
+        v
+Fireworks or Anthropic
+        |
+        | normalized complete or streaming response
+        v
+Client + private usage record in SQLite
+```
+
+For a file-by-file explanation of the implementation, see [`CODE_GUIDE.md`](CODE_GUIDE.md).
+
+## Quick start
+
+### 1. Install dependencies
+
+Python 3.10 or newer is recommended.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+### 2. Configure at least one provider
+
+Copy `.env.example` to an ignored `.env`, then fill in only the credentials you intend to use.
+
+```bash
+cp .env.example .env
+```
 
 ```text
 FIREWORK_API_KEY=...
@@ -15,7 +91,7 @@ ANTHROPIC_URL=https://api.anthropic.com/v1/messages
 
 Never commit or display `.env`.
 
-## Initialize or migrate SQLite
+### 3. Initialize or migrate SQLite
 
 ```bash
 python -m auth.database
@@ -25,28 +101,36 @@ Existing Phase 2 keys automatically keep their original provider permission.
 
 The same startup migration also creates `usage_logs`, adds cache metrics to older logs, and creates the Phase 5.2 `response_cache` table.
 
-## Manage virtual keys and permissions
+### 4. Create a virtual key
 
 ```bash
 # Create a key with its first Fireworks permission.
 python -m auth.cli create --app jan --provider fireworks
-
-# Safely list key IDs, prefixes, status, and provider permissions.
-python -m auth.cli list
-
-# Grant that same key access to Anthropic.
-python -m auth.cli grant --id 1 --provider anthropic --credential default
-
-# Revoke the complete key and all of its provider access.
-python -m auth.cli revoke --id 1
 ```
 
 The complete virtual key is displayed only once when it is created.
 
-## Run the gateway
+### 5. Run the gateway
 
 ```bash
 uvicorn api.main:app --reload
+```
+
+The gateway is now available at `http://127.0.0.1:8000`.
+
+## Virtual-key management
+
+Use the CLI to inspect permissions, add another provider, or revoke a key:
+
+```bash
+# Safely list key IDs, prefixes, status, and provider permissions.
+python -m auth.cli list
+
+# Grant an existing key access to Anthropic.
+python -m auth.cli grant --id 1 --provider anthropic --credential default
+
+# Revoke the complete key and all of its provider access.
+python -m auth.cli revoke --id 1
 ```
 
 ## Configured public models
