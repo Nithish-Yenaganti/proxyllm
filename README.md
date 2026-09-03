@@ -60,7 +60,7 @@ Fireworks or Anthropic
 Client + private usage record in SQLite
 ```
 
-For a file-by-file explanation of the implementation, see [`CODE_GUIDE.md`](CODE_GUIDE.md).
+For system boundaries and design decisions, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For a file-by-file implementation explanation, see [`CODE_GUIDE.md`](CODE_GUIDE.md).
 
 ## Quick start
 

@@ -1,0 +1,384 @@
+# ProxyLLM Architecture
+
+**Status:** Current design  
+**Architecture style:** Asynchronous modular monolith  
+**Primary interface:** OpenAI-compatible `POST /v1/chat/completions`
+
+This document describes how ProxyLLM is structured, why the current design was chosen, where its trust boundaries are, and when the architecture should change.
+
+## 1. Goals
+
+ProxyLLM is designed to provide:
+
+- one stable API for multiple LLM providers;
+- server-side ownership of real provider credentials;
+- revocable application-level virtual keys;
+- explicit model routing and provider authorization;
+- normalized complete and streaming responses;
+- privacy-conscious usage, cost, and latency measurement; and
+- optional response caching for eligible requests.
+
+The current design optimizes for local development, prototypes, portfolio work, and controlled internal deployments. It favors a small operational footprint and clear module boundaries over distributed-system complexity.
+
+## 2. Non-goals
+
+The current implementation does not attempt to provide:
+
+- automatic provider fallback or load balancing;
+- distributed caching or multi-region operation;
+- a high-availability database;
+- built-in rate limiting, quotas, or budget enforcement;
+- an administrative web API or user interface;
+- arbitrary provider URLs, credentials, or models supplied by clients;
+- semantic caching; or
+- complete translation of every provider feature, such as Anthropic tool calling.
+
+## 3. System context
+
+```mermaid
+flowchart LR
+    Client[OpenAI-compatible client]
+    Admin[Administrator CLI]
+    Gateway[ProxyLLM / FastAPI]
+    DB[(SQLite)]
+    Env[Environment configuration]
+    Fireworks[Fireworks API]
+    Anthropic[Anthropic Messages API]
+
+    Client -->|virtual key + model + messages| Gateway
+    Gateway -->|normalized response or SSE| Client
+    Admin -->|create, grant, list, revoke| DB
+    Gateway -->|keys, permissions, usage, cache| DB
+    Env -->|provider URLs and secrets| Gateway
+    Gateway -->|OpenAI-compatible request| Fireworks
+    Gateway -->|translated Messages request| Anthropic
+```
+
+The client controls the public model name and generation parameters. It does not control the upstream URL, real provider credential, provider adapter, or database permission.
+
+## 4. Component design
+
+| Component | Responsibility | Key files |
+| --- | --- | --- |
+| HTTP application | Owns request validation, routing, caching, response construction, and usage logging | `api/main.py` |
+| Authentication middleware | Validates bearer virtual keys and attaches safe key metadata to the request | `api/middleware.py` |
+| Key administration | Creates, lists, grants permissions to, and revokes virtual keys | `auth/cli.py`, `auth/keys.py` |
+| Persistence | Initializes and queries the SQLite schema | `auth/database.py` |
+| Model registry | Maps allowed public model names to trusted providers, upstream models, and price snapshots | `providers/registry.py` |
+| Provider contract | Defines provider-independent requests, responses, credentials, and errors | `providers/base.py` |
+| Fireworks adapter | Forwards an already OpenAI-compatible provider protocol | `providers/fireworks.py` |
+| Anthropic adapter | Translates OpenAI chat requests and Anthropic Messages responses in both complete and streaming modes | `providers/anthropic.py` |
+| Usage tracking | Normalizes token usage, estimates cost, and observes streams without buffering them | `usage/tracking.py` |
+| Response cache | Determines eligibility and builds privacy-scoped deterministic cache keys | `usage/cache.py` |
+| Measurement tools | Measure overhead, cache behavior, and load independently of the request path | `benchmarks/` |
+
+These are code boundaries inside one process, not independently deployed services.
+
+## 5. Request lifecycle
+
+### 5.1 Complete response
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as Auth middleware
+    participant A as API route
+    participant D as SQLite
+    participant R as Model registry
+    participant P as Provider adapter
+    participant U as Upstream provider
+
+    C->>M: POST /v1/chat/completions + bearer key
+    M->>D: Find active key by SHA-256 hash
+    D-->>M: Safe key metadata
+    M->>A: Authenticated request
+    A->>R: Resolve exact public model
+    R-->>A: Provider, upstream model, prices
+    A->>D: Check key/provider permission
+    D-->>A: Credential reference
+    A->>A: Resolve server-side environment credential
+    A->>D: Check eligible response cache
+    alt Cache hit
+        D-->>A: Stored successful response
+        A->>D: Record hit and avoided cost
+        A-->>C: Cached response
+    else Cache miss or bypass
+        A->>P: Provider-independent AdapterRequest
+        P->>U: Provider-specific HTTP request
+        U-->>P: Provider response
+        P-->>A: Normalized AdapterResponse
+        A->>D: Record usage and optionally cache response
+        A-->>C: OpenAI-compatible response
+    end
+```
+
+Validation and authorization happen before a real provider credential is resolved or an upstream connection is opened.
+
+### 5.2 Streaming response
+
+Streaming uses the same authentication, routing, and authorization path. The differences are:
+
+1. The response cache is always bypassed.
+2. Fireworks SSE bytes are passed through unchanged because they are already OpenAI-compatible.
+3. Anthropic named SSE events are translated into OpenAI-compatible chat-completion chunks.
+4. Usage tracking observes a copy of each chunk without buffering the full stream.
+5. The final usage row distinguishes success, provider error, incomplete output, stream failure, and client disconnection.
+6. Upstream responses and HTTP clients are closed in `finally` blocks after completion, cancellation, or disconnection.
+
+This preserves time-to-first-token behavior while still recording a single outcome for the request.
+
+## 6. Routing and provider abstraction
+
+Routing is an exact lookup in `MODEL_ROUTES`. Each route contains:
+
+- the provider name;
+- the trusted upstream model identifier;
+- uncached input cost per million tokens;
+- output cost per million tokens; and
+- cached input cost per million tokens.
+
+Exact routing is intentionally safer than deriving a provider from an arbitrary model prefix. Adding a model is a deployment decision: its route and price snapshot must be reviewed in code.
+
+Every provider implements the `ProviderAdapter` contract:
+
+```text
+AdapterRequest -> ProviderAdapter.send() -> AdapterResponse
+```
+
+The API layer therefore owns policy, while adapters own provider protocol details. A new provider should not require changes to authentication, permission checks, caching policy, or usage storage.
+
+## 7. Data design
+
+```mermaid
+erDiagram
+    virtual_keys ||--o{ virtual_key_provider_permissions : grants
+    virtual_keys ||--o{ usage_logs : produces
+    virtual_keys ||--o{ response_cache : owns
+
+    virtual_keys {
+        integer id PK
+        text app_name
+        text key_prefix
+        text key_hash UK
+        integer is_active
+        text created_at
+        text revoked_at
+    }
+
+    virtual_key_provider_permissions {
+        integer key_id PK, FK
+        text provider PK
+        text provider_credential
+    }
+
+    usage_logs {
+        integer id PK
+        integer virtual_key_id FK
+        text provider
+        text model
+        integer prompt_tokens
+        integer completion_tokens
+        real estimated_cost_usd
+        real latency_ms
+        text status
+        integer status_code
+        text cache_status
+        real cost_avoided_usd
+        text created_at
+    }
+
+    response_cache {
+        text cache_key PK
+        integer virtual_key_id FK
+        text provider
+        text model
+        blob response_body
+        text response_headers_json
+        real estimated_cost_usd
+        real expires_at_unix
+    }
+```
+
+SQLite uses foreign-key enforcement, a five-second busy timeout, and write-ahead logging (WAL). The database is initialized and migrated during application startup.
+
+### Data retention and privacy
+
+ProxyLLM stores hashes and operational metadata, not plaintext secrets or conversation content in usage logs:
+
+- virtual keys are stored as SHA-256 hashes;
+- only a short non-secret key prefix is shown for identification;
+- provider credentials remain in environment configuration;
+- usage logs exclude prompts and generated answers; and
+- cache indexes contain a SHA-256 hash of the normalized request, scoped by virtual-key ID.
+
+The response cache does contain complete response bodies for up to one hour. It is therefore sensitive local data even though entries cannot cross virtual-key boundaries.
+
+## 8. Cache design
+
+A request is eligible only when it is non-streaming and either:
+
+- explicitly sets numeric `temperature` to `0`; or
+- explicitly opts in with `"cache": true`.
+
+`"cache": false` always opts out. The gateway-only field is removed before provider translation.
+
+The cache key is:
+
+```text
+SHA-256(virtual_key_id + canonical provider request JSON)
+```
+
+Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Entries expire after one hour and only successful complete responses are stored.
+
+The cache is fail-open: a cache read or write failure is logged, but it does not make an otherwise valid provider request fail.
+
+## 9. Security boundaries
+
+The main trust boundary is between the client-controlled request and trusted server configuration.
+
+### Client-controlled
+
+- bearer virtual key;
+- public model name;
+- messages and supported generation parameters; and
+- cache opt-in or opt-out.
+
+### Server-controlled
+
+- key activation state and provider permissions;
+- model-to-provider and model-to-price mappings;
+- provider credential references;
+- real provider URLs and API keys;
+- adapter selection; and
+- database path and cache lifetime.
+
+Important safeguards include:
+
+- the plaintext virtual key is displayed only once at creation;
+- unknown and revoked keys return the same authentication response;
+- unauthorized provider access stops before an upstream call;
+- clients cannot submit arbitrary upstream URLs or credentials;
+- only selected safe upstream response headers cross the gateway; and
+- errors returned to clients do not include secrets or raw internal exceptions.
+
+Production deployments still need TLS termination, network access controls, rate limiting, secret management, database backup policy, log retention policy, and monitoring.
+
+## 10. Error model and observability
+
+The gateway presents stable OpenAI-style JSON error envelopes. Important status categories include:
+
+| HTTP status | Meaning |
+| --- | --- |
+| `400` | Invalid JSON, invalid request shape, or unsupported provider translation |
+| `401` | Missing, malformed, unknown, or revoked virtual key |
+| `403` | Valid key without permission for the routed provider |
+| `404` | Public model is not registered |
+| `500` | Trusted provider or adapter configuration is missing |
+| `502` | Upstream connection or protocol failure |
+
+Every authenticated chat request attempts to write one `usage_logs` record. Logging failures are isolated from successful provider responses. Cost values are estimates based on route-level price snapshots, not provider invoices.
+
+## 11. Deployment model
+
+The minimum deployment is one Uvicorn/FastAPI process with:
+
+- a writable local filesystem for `auth/gateway.db`;
+- environment variables for provider credentials and URLs; and
+- outbound HTTPS access to the configured providers.
+
+This topology is deliberately simple. SQLite WAL supports modest concurrent access, but the database remains a single-host dependency. Multiple application workers that share the same local database may work at small scale, but multiple containers or hosts require a shared database and a different cache design.
+
+## 12. Architecture decisions
+
+### ADR-001: Keep the gateway as a modular monolith
+
+**Decision:** Keep v1 as one asynchronous FastAPI service with internal module boundaries.
+
+**Reason:** Authentication, authorization, routing, caching, forwarding, and logging form one request lifecycle and share one small data store. Splitting them would introduce network failure modes, deployment coordination, and distributed tracing without a current scaling or ownership need.
+
+**Operational cost:** One Python service and one SQLite database.
+
+**Scaling limit:** A single-host database, provider connection capacity, and Python process resources bound throughput.
+
+**Migration risk:** Low while module contracts remain explicit. Provider adapters and database functions are already separable boundaries.
+
+**Rejected alternative:** Independent auth, routing, cache, and usage services. This is currently overkill.
+
+### ADR-002: Use SQLite as the local system of record
+
+**Decision:** Keep keys, permissions, usage, and cached responses in SQLite for the current deployment target.
+
+**Reason:** The data is relational, small, local, and transactionally coupled. SQLite avoids operating a database server while supporting indexes, foreign keys, and WAL.
+
+**Operational cost:** File permissions, backups, retention, and occasional cleanup must be managed on the host.
+
+**Scaling limit:** Sustained write contention, multi-host deployment, large usage history, or strict high-availability requirements.
+
+**Migration risk:** Medium. SQL concepts transfer cleanly, but schema migrations, timestamp types, upsert syntax, and cache BLOB handling must be tested against PostgreSQL.
+
+**Next step when exceeded:** Move durable identity, permissions, and usage data to PostgreSQL. Move cached responses to Redis only if independent cache scaling or eviction behavior is actually needed.
+
+### ADR-003: Route through an explicit allowlist and adapters
+
+**Decision:** Keep exact model routes in code and isolate provider protocols behind `ProviderAdapter`.
+
+**Reason:** This prevents arbitrary upstream access, makes price snapshots reviewable, and keeps client behavior independent of provider schemas.
+
+**Operational cost:** Adding or repricing a model requires a code change and deployment.
+
+**Scaling limit:** A very large or frequently changing model catalog would make a static registry cumbersome.
+
+**Migration risk:** Low. The registry could later move to validated configuration or an administrative data store without changing the adapter contract.
+
+**Dangerous to skip:** Route validation and permission checks must remain ahead of provider credential resolution.
+
+### ADR-004: Cache only complete responses with explicit safety rules
+
+**Decision:** Keep a per-virtual-key, exact-match response cache for eligible non-streaming requests.
+
+**Reason:** Exact deterministic caching is understandable and measurable. Per-key scoping prevents cross-application response leakage.
+
+**Operational cost:** Sensitive cached response bodies require filesystem protection and expiration maintenance.
+
+**Scaling limit:** SQLite storage size, local-only availability, and the absence of coordinated eviction across hosts.
+
+**Rejected alternative:** Semantic caching. It adds correctness, privacy, embedding, and invalidation risks that the current product does not need.
+
+### ADR-005: Treat observability as non-blocking
+
+**Decision:** Record one safe usage row per authenticated request without allowing logging failures to replace valid provider responses.
+
+**Reason:** Accounting is valuable, but it is not part of response correctness for this development-focused gateway.
+
+**Operational cost:** A storage failure may create gaps in usage history and must be detected through application logs.
+
+**Dangerous to skip in production:** Alerting on persistence failures and reconciling gateway estimates against provider invoices.
+
+## 13. Scaling and evolution triggers
+
+Change the architecture in response to measured constraints, not anticipated fashion.
+
+| Signal | Appropriate change |
+| --- | --- |
+| SQLite write-lock contention or database latency affects requests | Tune retention first; then migrate durable data to PostgreSQL |
+| More than one gateway host must share cache entries | Introduce Redis for response caching |
+| Usage reporting queries compete with request writes | Export usage asynchronously to an analytics store |
+| One provider becomes a reliability bottleneck | Add explicit retry and fallback policy with idempotency and cost controls |
+| Different teams independently own gateway subsystems | Consider service separation along established module boundaries |
+| Model catalog changes too frequently for deployments | Move routes to validated, versioned configuration with an audit trail |
+| Untrusted or internet-facing clients use the gateway | Add TLS, rate limits, quotas, structured audit logs, and stronger secret storage |
+
+## 14. Adding a provider
+
+To add another provider without breaking the architecture:
+
+1. Implement `ProviderAdapter.send()` in a new module under `providers/`.
+2. Translate requests and responses without leaking provider-specific types into `api/main.py`.
+3. Normalize complete and streaming usage into the OpenAI-compatible fields.
+4. Register the adapter and explicit public model routes in `providers/registry.py`.
+5. Add a trusted credential mapping in server configuration.
+6. Grant provider permissions through the existing database and CLI boundary.
+7. Test complete responses, streaming, errors, cleanup, usage accounting, and authorization denial.
+
+Provider fallback should be introduced only with an explicit policy for model equivalence, retries, duplicate billing, latency budgets, and streaming failures.
+
