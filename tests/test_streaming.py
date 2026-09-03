@@ -187,6 +187,7 @@ class FireworksStreamingTests(unittest.IsolatedAsyncioTestCase):
                     "model": "accounts/fireworks/models/test-model",
                     "messages": [{"role": "user", "content": "Hello"}],
                     "stream": True,
+                    "stream_options": {"include_usage": True},
                 }
             ],
         )

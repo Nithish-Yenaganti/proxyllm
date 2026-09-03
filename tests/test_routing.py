@@ -18,12 +18,13 @@ from providers.base import AdapterRequest, AdapterResponse
 
 
 # Builds one authenticated in-memory request for the real chat route.
-def build_chat_request(model: str) -> Request:
+def build_chat_request(model: str, *, stream: bool = False) -> Request:
     # Creates the unified JSON body sent by an OpenAI-compatible client.
     request_body = json.dumps(
         {
             "model": model,
             "messages": [{"role": "user", "content": "Hello"}],
+            "stream": stream,
         }
     ).encode("utf-8")
 
@@ -106,8 +107,55 @@ class RecordingAdapter:
         )
 
 
+# Returns a lazy OpenAI-compatible SSE response for route-level logging tests.
+class StreamingRecordingAdapter:
+    # Matches the registered provider name selected by the model route.
+    name = "fireworks"
+
+    # Returns a body whose usage is unavailable until downstream consumption.
+    async def send(self, _request: AdapterRequest) -> AdapterResponse:
+        # Produces one usage event and the required completion marker lazily.
+        async def stream_body():
+            # Sends final cumulative counters in OpenAI's streaming format.
+            yield (
+                b'data: {"choices":[],"usage":{"prompt_tokens":10,'
+                b'"completion_tokens":5,"total_tokens":15}}\n\n'
+            )
+
+            # Marks the response stream complete for the client and observer.
+            yield b"data: [DONE]\n\n"
+
+        # Gives main.py the same provider-independent streaming container as production.
+        return AdapterResponse(
+            status_code=200,
+            headers={"Content-Type": "text/event-stream"},
+            body=stream_body(),
+            streaming=True,
+        )
+
+
 # Exercises routing through the real FastAPI route without provider network access.
 class MultiProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
+    # Replaces Phase 5.1 persistence so routing tests never touch the real database.
+    async def asyncSetUp(self) -> None:
+        # Creates one reusable asynchronous mock for every usage insert in this test.
+        self.usage_log_writer = AsyncMock(return_value=1)
+
+        # Replaces only the imported database writer inside the route module.
+        self.usage_log_patch = patch.object(
+            main,
+            "create_usage_log_record",
+            self.usage_log_writer,
+        )
+
+        # Activates isolation before any route function is called.
+        self.usage_log_patch.start()
+
+    # Restores the real writer after each isolated routing test.
+    async def asyncTearDown(self) -> None:
+        # Stops this test's patch even when an assertion fails.
+        self.usage_log_patch.stop()
+
     # Confirms one endpoint selects Fireworks and Anthropic from the model field.
     async def test_model_selects_provider_adapter(self) -> None:
         # Defines one public model and expected real target for each provider.
@@ -171,6 +219,12 @@ class MultiProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.body, b'{"ok":true}')
 
+                # Confirms Phase 5.1 recorded this completed routed request once.
+                self.usage_log_writer.assert_awaited_once()
+
+                # Clears this subtest's call before testing the other provider.
+                self.usage_log_writer.reset_mock()
+
                 # Confirms authorization checked this key and routed provider together.
                 permission_lookup.assert_awaited_once_with(42, provider)
 
@@ -217,6 +271,13 @@ class MultiProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
         # Confirms no credential permission or provider request was attempted.
         permission_lookup.assert_not_awaited()
 
+        # Confirms rejected authenticated requests are still measurable.
+        self.usage_log_writer.assert_awaited_once()
+        self.assertEqual(
+            self.usage_log_writer.await_args.kwargs["status"],
+            "model_not_found",
+        )
+
     # Confirms a valid key cannot use a provider it was not granted.
     async def test_missing_provider_permission_is_rejected(self) -> None:
         # Simulates a database lookup with no Anthropic permission for this key.
@@ -242,6 +303,74 @@ class MultiProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         # Confirms the permission check used the authenticated key and routed provider.
         permission_lookup.assert_awaited_once_with(42, "anthropic")
+
+        # Confirms authorization denials are stored with their own searchable status.
+        self.usage_log_writer.assert_awaited_once()
+        self.assertEqual(
+            self.usage_log_writer.await_args.kwargs["status"],
+            "denied",
+        )
+
+    # Confirms stream metrics are written after final usage becomes available.
+    async def test_stream_usage_is_logged_after_downstream_consumption(self) -> None:
+        # Supplies the Fireworks permission required by the configured public model.
+        permission_lookup = AsyncMock(
+            return_value={
+                "provider": "fireworks",
+                "provider_credential": "default",
+            }
+        )
+
+        # Uses a lazy in-memory adapter that cannot contact a real provider.
+        adapter = StreamingRecordingAdapter()
+
+        # Replaces credentials, permission I/O, and provider I/O for this route call.
+        with (
+            patch.dict(
+                main.PROVIDER_CREDENTIALS,
+                {
+                    ("fireworks", "default"): {
+                        "url": "https://fireworks.test/api",
+                        "api_key": "test-provider-secret",
+                    }
+                },
+                clear=True,
+            ),
+            patch.object(
+                main,
+                "get_provider_permission_for_key",
+                permission_lookup,
+            ),
+            patch.object(
+                main,
+                "get_provider_adapter",
+                return_value=adapter,
+            ),
+        ):
+            # Opens the response without consuming any generated SSE event yet.
+            response = await main.chat_completions(
+                build_chat_request(
+                    "fireworks/deepseek-v4-flash",
+                    stream=True,
+                )
+            )
+
+            # Proves no incomplete row is written when only response headers exist.
+            self.usage_log_writer.assert_not_awaited()
+
+            # Consumes the stream as FastAPI would while sending it to a chat client.
+            response_chunks = [chunk async for chunk in response.body_iterator]
+
+        # Confirms both provider chunks still reached the downstream consumer.
+        self.assertEqual(len(response_chunks), 2)
+
+        # Confirms the final token totals produced exactly one completed usage record.
+        self.usage_log_writer.assert_awaited_once()
+        log_fields = self.usage_log_writer.await_args.kwargs
+        self.assertEqual(log_fields["prompt_tokens"], 10)
+        self.assertEqual(log_fields["completion_tokens"], 5)
+        self.assertEqual(log_fields["total_tokens"], 15)
+        self.assertEqual(log_fields["status"], "success")
 
 
 # Runs this test module directly when requested from the terminal.
