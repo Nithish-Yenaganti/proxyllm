@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the current single-host ProxyLLM project.
+Accepted and implemented for the current single-host ProxyLLM project.
 
 ## Decision
 
@@ -17,9 +17,16 @@ Keep ProxyLLM as one FastAPI process and keep authentication, usage logs, and de
 
 ## Data model direction
 
-`usage_logs` gains `cache_status` and `cost_avoided_usd`. `response_cache` stores a SHA-256 key, owning virtual-key ID, provider/model identity, complete successful response, safe headers, original estimated cost, and one-hour expiry.
+`usage_logs` gains `cache_status` and `cost_avoided_usd`. `response_cache` stores a
+SHA-256 key, owning virtual-key ID, provider/model identity, complete successful
+response, safe headers, original estimated cost, and one-hour reuse deadline.
 
 The hash covers the virtual-key ID and canonical JSON for model, messages, and request parameters after removing gateway-only cache control. Including the virtual-key ID intentionally prevents cross-application response leakage.
+
+Implementation note: cache eligibility is evaluated before provider translation. The
+current Anthropic adapter omits `temperature`, so `temperature: 0` eligibility does not
+by itself prove deterministic Anthropic sampling; callers that require a fresh result
+must send `cache: false`.
 
 ## System boundaries
 
@@ -47,7 +54,10 @@ This design reuses the existing deployable components, produces inspectable meas
 
 ## Operational cost
 
-SQLite needs no separate server, but every cache miss adds one lookup and successful cacheable responses add one write. Cache bodies consume local disk until they expire; a later maintenance command should delete expired rows if long-running deployments accumulate many entries.
+SQLite needs no separate server, but every eligible request adds one cache lookup and
+successful cacheable responses add one write. Expiry prevents reuse but does not delete
+a row, so cache bodies continue consuming local disk until an operator or future
+maintenance command removes expired entries.
 
 Real latency, cache, and load workloads consume provider credit. The mock provider verifies mechanics at zero provider cost, but synthetic numbers must never be presented as production measurements.
 

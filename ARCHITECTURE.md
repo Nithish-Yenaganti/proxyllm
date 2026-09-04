@@ -91,14 +91,16 @@ flowchart TD
     Configured{Credential and adapter configured?}
     Eligible{Cache eligible?}
     Hit{Cache hit?}
-    Provider[Call selected provider adapter]
-    ProviderOK{Provider responded?}
+    Provider[Translate and call selected provider adapter]
+    AdapterResult{Adapter result}
     Stream{Streaming response?}
-    Complete[Normalize complete response]
+    Complete[Normalize or pass through complete response]
     Streaming[Forward or translate SSE stream]
     CacheStore[Store eligible successful response]
     Log[Record usage and outcome]
-    Return([Return response])
+    StreamLog[Record final stream usage and outcome]
+    Return([Return complete response])
+    StreamReturn([Stream response to client])
     Error401([401 authentication error])
     Error400([400 or 404 request error])
     Error403([403 authorization error])
@@ -118,12 +120,14 @@ flowchart TD
     Eligible -->|no| Provider
     Hit -->|yes| Log
     Hit -->|no| Provider
-    Provider --> ProviderOK
-    ProviderOK -->|no| Error502
-    ProviderOK -->|yes| Stream
+    Provider --> AdapterResult
+    AdapterResult -->|unsupported request| Error400
+    AdapterResult -->|connection or protocol failure| Error502
+    AdapterResult -->|upstream HTTP response| Stream
     Stream -->|yes| Streaming
     Stream -->|no| Complete
-    Streaming --> Log
+    Streaming --> StreamReturn
+    Streaming -.->|when stream ends| StreamLog
     Complete --> CacheStore
     CacheStore --> Log
     Log --> Return
@@ -181,6 +185,8 @@ erDiagram
         text app_name
         text key_prefix
         text key_hash UK
+        text provider
+        text provider_credential
         integer is_active
         text created_at
         text revoked_at
@@ -198,7 +204,9 @@ erDiagram
         text provider
         text model
         integer prompt_tokens
+        integer cached_prompt_tokens
         integer completion_tokens
+        integer total_tokens
         real estimated_cost_usd
         real latency_ms
         text status
@@ -213,14 +221,19 @@ erDiagram
         integer virtual_key_id FK
         text provider
         text model
+        integer response_status_code
         blob response_body
         text response_headers_json
         real estimated_cost_usd
+        real created_at_unix
         real expires_at_unix
     }
 ```
 
-SQLite uses foreign-key enforcement, a five-second busy timeout, and write-ahead logging (WAL). The database is initialized and migrated during application startup.
+Database initialization enables write-ahead logging (WAL). Foreign-key enforcement and
+a five-second busy timeout are applied during initialization and on the request-path
+connections that authenticate, authorize, log usage, and read or write cache entries.
+The schema is initialized and migrated during application startup.
 
 ### Data retention and privacy
 
@@ -230,9 +243,13 @@ ProxyLLM stores hashes and operational metadata, not plaintext secrets or conver
 - only a short non-secret key prefix is shown for identification;
 - provider credentials remain in environment configuration;
 - usage logs exclude prompts and generated answers; and
-- cache indexes contain a SHA-256 hash of the normalized request, scoped by virtual-key ID.
+- cache indexes contain a SHA-256 hash of the canonical request body after removing
+  gateway-only cache control, scoped by virtual-key ID.
 
-The response cache does contain complete response bodies for up to one hour. It is therefore sensitive local data even though entries cannot cross virtual-key boundaries.
+The response cache contains complete response bodies and is therefore sensitive local
+data even though entries cannot cross virtual-key boundaries. Responses stop being
+eligible for reuse after one hour, but expired rows are not currently deleted
+automatically.
 
 ## 8. Cache design
 
@@ -243,15 +260,20 @@ A request is eligible only when it is non-streaming and either:
 
 `"cache": false` always opts out. The gateway-only field is removed before provider translation.
 
+Eligibility is evaluated before provider translation. The Anthropic adapter currently
+omits `temperature`, so automatic eligibility from `temperature: 0` does not prove that
+Anthropic used deterministic sampling. Clients that require a fresh Anthropic result
+must opt out with `"cache": false`.
+
 The cache key is:
 
 ```text
-SHA-256(virtual_key_id + canonical provider request JSON)
+SHA-256(virtual_key_id + canonical request JSON without the cache field)
 ```
 
-Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Entries expire after one hour and only successful complete responses are stored.
+Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Only successful complete responses are stored, and lookups ignore an entry after its one-hour reuse window.
 
-The cache is fail-open: a cache read or write failure is logged, but it does not make an otherwise valid provider request fail.
+The cache is fail-open: a cache read or write failure is logged, but it does not make an otherwise valid provider request fail. A failed read continues as a miss; a failed write returns the provider response with `X-Proxy-Cache: ERROR`.
 
 ## 9. Security boundaries
 
@@ -296,6 +318,9 @@ The gateway presents stable OpenAI-style JSON error envelopes. Important status 
 | `404` | Public model is not registered |
 | `500` | Trusted provider or adapter configuration is missing |
 | `502` | Upstream connection or protocol failure |
+
+Upstream HTTP errors that arrive as valid responses preserve the provider status code.
+Fireworks bodies pass through unchanged; Anthropic error bodies are normalized.
 
 Every authenticated chat request attempts to write one `usage_logs` record. Logging failures are isolated from successful provider responses. Cost values are estimates based on route-level price snapshots, not provider invoices.
 
@@ -357,9 +382,10 @@ This topology is deliberately simple. SQLite WAL supports modest concurrent acce
 
 **Decision:** Keep a per-virtual-key, exact-match response cache for eligible non-streaming requests.
 
-**Reason:** Exact deterministic caching is understandable and measurable. Per-key scoping prevents cross-application response leakage.
+**Reason:** Exact-request caching is understandable and measurable. Per-key scoping prevents cross-application response leakage.
 
-**Operational cost:** Sensitive cached response bodies require filesystem protection and expiration maintenance.
+**Operational cost:** Sensitive cached response bodies require filesystem protection and
+explicit cleanup because expiry prevents reuse but does not remove rows.
 
 **Scaling limit:** SQLite storage size, local-only availability, and the absence of coordinated eviction across hosts.
 
@@ -367,7 +393,7 @@ This topology is deliberately simple. SQLite WAL supports modest concurrent acce
 
 ### ADR-005: Treat observability as non-blocking
 
-**Decision:** Record one safe usage row per authenticated request without allowing logging failures to replace valid provider responses.
+**Decision:** Attempt to record one safe usage row per authenticated request without allowing logging failures to replace valid provider responses.
 
 **Reason:** Accounting is valuable, but it is not part of response correctness for this development-focused gateway.
 
@@ -402,3 +428,8 @@ To add another provider without breaking the architecture:
 7. Test complete responses, streaming, errors, cleanup, usage accounting, and authorization denial.
 
 Provider fallback should be introduced only with an explicit policy for model equivalence, retries, duplicate billing, latency budgets, and streaming failures.
+
+## 15. Related decision record
+
+The historical rationale for the measurement and cache implementation is recorded in
+[`docs/adr/0001-phase-5-measurement-and-cache.md`](docs/adr/0001-phase-5-measurement-and-cache.md).
