@@ -33,25 +33,29 @@ The current implementation does not attempt to provide:
 - semantic caching; or
 - complete translation of every provider feature, such as Anthropic tool calling.
 
-## 3. System context
+## 3. High-level system overview
 
 ```mermaid
 flowchart LR
-    Client[OpenAI-compatible client]
-    Admin[Administrator CLI]
-    Gateway[ProxyLLM / FastAPI]
+    Client[OpenAI-compatible clients]
+    Admin[Administrator]
+    CLI[Key-management CLI]
+    Gateway[ProxyLLM gateway]
     DB[(SQLite)]
-    Env[Environment configuration]
+    Config[Environment configuration]
+    Adapters[Provider adapters]
     Fireworks[Fireworks API]
-    Anthropic[Anthropic Messages API]
+    Anthropic[Anthropic API]
 
-    Client -->|virtual key + model + messages| Gateway
-    Gateway -->|normalized response or SSE| Client
-    Admin -->|create, grant, list, revoke| DB
-    Gateway -->|keys, permissions, usage, cache| DB
-    Env -->|provider URLs and secrets| Gateway
-    Gateway -->|OpenAI-compatible request| Fireworks
-    Gateway -->|translated Messages request| Anthropic
+    Client -->|chat requests| Gateway
+    Gateway -->|compatible responses| Client
+    Admin --> CLI
+    CLI -->|manage keys and permissions| DB
+    Gateway <-->|authentication, cache, usage| DB
+    Config -->|trusted credentials| Gateway
+    Gateway --> Adapters
+    Adapters --> Fireworks
+    Adapters --> Anthropic
 ```
 
 The client controls the public model name and generation parameters. It does not control the upstream URL, real provider credential, provider adapter, or database permission.
@@ -74,47 +78,64 @@ The client controls the public model name and generation parameters. It does not
 
 These are code boundaries inside one process, not independently deployed services.
 
-## 5. Request lifecycle
+## 5. Request-processing flow
 
-### 5.1 Complete response
+The main request path is shown separately from the system overview so authentication, routing, and cache decisions remain easy to follow.
 
 ```mermaid
-sequenceDiagram
-    participant C as Client
-    participant M as Auth middleware
-    participant A as API route
-    participant D as SQLite
-    participant R as Model registry
-    participant P as Provider adapter
-    participant U as Upstream provider
+flowchart TD
+    Start([Receive chat request])
+    Auth{Virtual key valid?}
+    Validate{Request and model valid?}
+    Permission{Provider permitted?}
+    Configured{Credential and adapter configured?}
+    Eligible{Cache eligible?}
+    Hit{Cache hit?}
+    Provider[Call selected provider adapter]
+    ProviderOK{Provider responded?}
+    Stream{Streaming response?}
+    Complete[Normalize complete response]
+    Streaming[Forward or translate SSE stream]
+    CacheStore[Store eligible successful response]
+    Log[Record usage and outcome]
+    Return([Return response])
+    Error401([401 authentication error])
+    Error400([400 or 404 request error])
+    Error403([403 authorization error])
+    Error500([500 configuration error])
+    Error502([502 provider error])
 
-    C->>M: POST /v1/chat/completions + bearer key
-    M->>D: Find active key by SHA-256 hash
-    D-->>M: Safe key metadata
-    M->>A: Authenticated request
-    A->>R: Resolve exact public model
-    R-->>A: Provider, upstream model, prices
-    A->>D: Check key/provider permission
-    D-->>A: Credential reference
-    A->>A: Resolve server-side environment credential
-    A->>D: Check eligible response cache
-    alt Cache hit
-        D-->>A: Stored successful response
-        A->>D: Record hit and avoided cost
-        A-->>C: Cached response
-    else Cache miss or bypass
-        A->>P: Provider-independent AdapterRequest
-        P->>U: Provider-specific HTTP request
-        U-->>P: Provider response
-        P-->>A: Normalized AdapterResponse
-        A->>D: Record usage and optionally cache response
-        A-->>C: OpenAI-compatible response
-    end
+    Start --> Auth
+    Auth -->|no| Error401
+    Auth -->|yes| Validate
+    Validate -->|no| Error400
+    Validate -->|yes| Permission
+    Permission -->|no| Error403
+    Permission -->|yes| Configured
+    Configured -->|no| Error500
+    Configured -->|yes| Eligible
+    Eligible -->|yes| Hit
+    Eligible -->|no| Provider
+    Hit -->|yes| Log
+    Hit -->|no| Provider
+    Provider --> ProviderOK
+    ProviderOK -->|no| Error502
+    ProviderOK -->|yes| Stream
+    Stream -->|yes| Streaming
+    Stream -->|no| Complete
+    Streaming --> Log
+    Complete --> CacheStore
+    CacheStore --> Log
+    Log --> Return
+    Error400 --> Log
+    Error403 --> Log
+    Error500 --> Log
+    Error502 --> Log
 ```
 
 Validation and authorization happen before a real provider credential is resolved or an upstream connection is opened.
 
-### 5.2 Streaming response
+### Streaming behavior
 
 Streaming uses the same authentication, routing, and authorization path. The differences are:
 
@@ -147,7 +168,7 @@ AdapterRequest -> ProviderAdapter.send() -> AdapterResponse
 
 The API layer therefore owns policy, while adapters own provider protocol details. A new provider should not require changes to authentication, permission checks, caching policy, or usage storage.
 
-## 7. Data design
+## 7. Data model
 
 ```mermaid
 erDiagram
@@ -381,4 +402,3 @@ To add another provider without breaking the architecture:
 7. Test complete responses, streaming, errors, cleanup, usage accounting, and authorization denial.
 
 Provider fallback should be introduced only with an explicit policy for model equivalence, retries, duplicate billing, latency budgets, and streaming failures.
-
