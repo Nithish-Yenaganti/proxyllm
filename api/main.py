@@ -171,6 +171,28 @@ async def record_request_usage(
         logger.exception("Unable to persist usage metrics")
 
 
+async def reject_request(
+    *,
+    virtual_key_id: int,
+    provider: str | None,
+    model: str | None,
+    model_route: ModelRoute | None,
+    started_at: float,
+    status: str,
+    status_code: int,
+    message: str,
+    error_type: str,
+    code: str,
+    cache_status: str = "not_eligible",
+) -> JSONResponse:
+    """Record a zero-token failure and build its existing public error response."""
+    await record_request_usage(
+        virtual_key_id, provider, model, model_route, TokenUsage(),
+        started_at, status, status_code, cache_status=cache_status,
+    )
+    return gateway_error(status_code, message, error_type, code)
+
+
 # Loads one cached response while allowing provider traffic if SQLite is unavailable.
 async def read_cached_response(cache_key: str) -> dict[str, object] | None:
     # Keeps cache infrastructure optional to core provider availability.
@@ -301,46 +323,32 @@ async def chat_completions(request: Request):
 
     # Handles malformed JSON without exposing an internal FastAPI exception.
     except (json.JSONDecodeError, UnicodeDecodeError):
-        # Records the rejected authenticated call even though no model could be read.
-        await record_request_usage(
-            virtual_key_id,
-            None,
-            None,
-            None,
-            TokenUsage(),
-            started_at,
-            "invalid_request",
-            400,
-        )
-
-        # Returns the public API's standard invalid-request response.
-        return gateway_error(
-            400,
-            "The request body must contain valid JSON.",
-            "invalid_request_error",
-            "invalid_json",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=None,
+            model=None,
+            model_route=None,
+            started_at=started_at,
+            status="invalid_request",
+            status_code=400,
+            message="The request body must contain valid JSON.",
+            error_type="invalid_request_error",
+            code="invalid_json",
         )
 
     # Requires a JSON object because adapters read named request fields.
     if not isinstance(body, dict):
-        # Records a body-shape failure without storing the submitted JSON value.
-        await record_request_usage(
-            virtual_key_id,
-            None,
-            None,
-            None,
-            TokenUsage(),
-            started_at,
-            "invalid_request",
-            400,
-        )
-
-        # Rejects arrays, strings, numbers, booleans, and null before routing.
-        return gateway_error(
-            400,
-            "The request body must be a JSON object.",
-            "invalid_request_error",
-            "invalid_request_body",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=None,
+            model=None,
+            model_route=None,
+            started_at=started_at,
+            status="invalid_request",
+            status_code=400,
+            message="The request body must be a JSON object.",
+            error_type="invalid_request_error",
+            code="invalid_request_body",
         )
 
     # Reads the public model name that controls Phase 4 provider routing.
@@ -348,24 +356,17 @@ async def chat_completions(request: Request):
 
     # Requires one non-empty model name before consulting the explicit registry.
     if not isinstance(requested_model, str) or requested_model == "":
-        # Records the validation failure without treating a malformed value as a model.
-        await record_request_usage(
-            virtual_key_id,
-            None,
-            None,
-            None,
-            TokenUsage(),
-            started_at,
-            "invalid_request",
-            400,
-        )
-
-        # Gives clients a stable validation error instead of a provider-specific failure.
-        return gateway_error(
-            400,
-            "The model field must be a non-empty string.",
-            "invalid_request_error",
-            "invalid_model",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=None,
+            model=None,
+            model_route=None,
+            started_at=started_at,
+            status="invalid_request",
+            status_code=400,
+            message="The model field must be a non-empty string.",
+            error_type="invalid_request_error",
+            code="invalid_model",
         )
 
     # Resolves the provider and real model using an explicit allowlisted mapping.
@@ -373,24 +374,17 @@ async def chat_completions(request: Request):
 
     # Rejects unknown models rather than guessing a provider from their name.
     if model_route is None:
-        # Records the requested public name while leaving its unknown provider empty.
-        await record_request_usage(
-            virtual_key_id,
-            None,
-            requested_model,
-            None,
-            TokenUsage(),
-            started_at,
-            "model_not_found",
-            404,
-        )
-
-        # Uses 404 because the requested gateway model does not exist.
-        return gateway_error(
-            404,
-            f"The model {requested_model!r} is not configured.",
-            "invalid_request_error",
-            "model_not_found",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=None,
+            model=requested_model,
+            model_route=None,
+            started_at=started_at,
+            status="model_not_found",
+            status_code=404,
+            message=f"The model {requested_model!r} is not configured.",
+            error_type="invalid_request_error",
+            code="model_not_found",
         )
 
     # Looks up this active virtual key's permission for the routed provider.
@@ -401,24 +395,17 @@ async def chat_completions(request: Request):
 
     # Rejects a valid key that lacks authorization for the selected provider.
     if provider_permission is None:
-        # Records denied authorization with zero usage because no provider call occurred.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "denied",
-            403,
-        )
-
-        # Uses 403 because authentication succeeded but provider authorization failed.
-        return gateway_error(
-            403,
-            "This virtual key cannot use the provider required by that model.",
-            "authorization_error",
-            "provider_not_allowed",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="denied",
+            status_code=403,
+            message="This virtual key cannot use the provider required by that model.",
+            error_type="authorization_error",
+            code="provider_not_allowed",
         )
 
     # Builds the trusted provider credential reference stored in SQLite.
@@ -432,24 +419,17 @@ async def chat_completions(request: Request):
 
     # Rejects database permissions that have no matching server configuration.
     if provider_config is None:
-        # Records the deployment mismatch before returning its sanitized server error.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "configuration_error",
-            500,
-        )
-
-        # Reports an internal deployment mismatch without revealing credential details.
-        return gateway_error(
-            500,
-            "The authorized provider credential is not configured.",
-            "server_configuration_error",
-            "provider_not_configured",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="configuration_error",
+            status_code=500,
+            message="The authorized provider credential is not configured.",
+            error_type="server_configuration_error",
+            code="provider_not_configured",
         )
 
     # Reads the real endpoint and secret from the trusted server configuration.
@@ -463,24 +443,17 @@ async def chat_completions(request: Request):
         or not isinstance(provider_api_key, str)
         or provider_api_key == ""
     ):
-        # Records missing trusted configuration without revealing which value was absent.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "configuration_error",
-            500,
-        )
-
-        # Returns a sanitized error without exposing environment variable contents.
-        return gateway_error(
-            500,
-            "The authorized provider is not configured.",
-            "server_configuration_error",
-            "provider_not_configured",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="configuration_error",
+            status_code=500,
+            message="The authorized provider is not configured.",
+            error_type="server_configuration_error",
+            code="provider_not_configured",
         )
 
     # Resolves the concrete adapter selected by the trusted model route.
@@ -488,24 +461,17 @@ async def chat_completions(request: Request):
 
     # Handles an invalid server registry without treating it as a client mistake.
     if provider_adapter is None:
-        # Records the invalid server registry before returning a stable deployment error.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "configuration_error",
-            500,
-        )
-
-        # Reports a deployment error without revealing internal class names.
-        return gateway_error(
-            500,
-            "The routed provider adapter is not configured.",
-            "server_configuration_error",
-            "adapter_not_configured",
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="configuration_error",
+            status_code=500,
+            message="The routed provider adapter is not configured.",
+            error_type="server_configuration_error",
+            code="adapter_not_configured",
         )
 
     # Removes the gateway-only cache flag before either hashing or provider translation.
@@ -620,48 +586,34 @@ async def chat_completions(request: Request):
 
     # Converts unsupported but well-formed translations into a client error.
     except ProviderRequestError as error:
-        # Records translation rejection before returning the adapter's safe explanation.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "invalid_request",
-            400,
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="invalid_request",
+            status_code=400,
+            message=str(error),
+            error_type="invalid_request_error",
+            code="unsupported_request",
             cache_status=cache_status,
-        )
-
-        # Returns the adapter's safe explanation without exposing provider credentials.
-        return gateway_error(
-            400,
-            str(error),
-            "invalid_request_error",
-            "unsupported_request",
         )
 
     # Converts DNS, TLS, connection, timeout, and invalid upstream responses to 502.
     except ProviderConnectionError:
-        # Records a provider connection failure with no fabricated token usage.
-        await record_request_usage(
-            virtual_key_id,
-            model_route.provider,
-            requested_model,
-            model_route,
-            TokenUsage(),
-            started_at,
-            "provider_error",
-            502,
+        return await reject_request(
+            virtual_key_id=virtual_key_id,
+            provider=model_route.provider,
+            model=requested_model,
+            model_route=model_route,
+            started_at=started_at,
+            status="provider_error",
+            status_code=502,
+            message="The upstream provider could not complete the request.",
+            error_type="provider_connection_error",
+            code="provider_unavailable",
             cache_status=cache_status,
-        )
-
-        # Uses one stable message regardless of which provider failed.
-        return gateway_error(
-            502,
-            "The upstream provider could not complete the request.",
-            "provider_connection_error",
-            "provider_unavailable",
         )
 
     # Uses FastAPI's lazy response type when the adapter returned an async byte iterator.
