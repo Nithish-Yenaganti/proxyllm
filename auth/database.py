@@ -54,6 +54,24 @@ CREATE TABLE IF NOT EXISTS virtual_key_provider_permissions (
 """
 
 
+# Stores one timestamp for each request admitted inside a key's rolling window.
+CREATE_RATE_LIMIT_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    virtual_key_id INTEGER NOT NULL,
+    accepted_at_unix REAL NOT NULL,
+    FOREIGN KEY (virtual_key_id) REFERENCES virtual_keys(id) ON DELETE CASCADE
+)
+"""
+
+
+# Makes per-key pruning, counting, and oldest-request lookup use one ordered index.
+CREATE_RATE_LIMIT_EVENTS_KEY_TIME_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_rate_limit_events_key_time
+ON rate_limit_events (virtual_key_id, accepted_at_unix)
+"""
+
+
 # Migrates each Phase 2 key's original provider fields into its initial permission.
 BACKFILL_PROVIDER_PERMISSIONS = """
 INSERT OR IGNORE INTO virtual_key_provider_permissions (
@@ -189,6 +207,10 @@ async def initialize_database(database_path: Path = DATABASE_PATH) -> None:
 
         # Gives every existing Phase 2 key its original provider permission.
         await database.execute(BACKFILL_PROVIDER_PERMISSIONS)
+
+        # Creates persistent accepted-request timestamps for rolling-window throttling.
+        await database.execute(CREATE_RATE_LIMIT_EVENTS_TABLE)
+        await database.execute(CREATE_RATE_LIMIT_EVENTS_KEY_TIME_INDEX)
 
         # Creates Phase 5.1 request accounting without changing existing key records.
         await database.execute(CREATE_USAGE_LOGS_TABLE)
@@ -498,7 +520,37 @@ async def create_usage_log_record(
     return log_id
 
 
-# Returns stored usage rows for tests and future Phase 5 reporting features.
+async def summarize_usage(
+    virtual_key_id: int | None = None,
+    database_path: Path = DATABASE_PATH,
+) -> list[dict[str, object]]:
+    """Aggregate all-time recorded usage per key, including revoked keys."""
+    await initialize_database(database_path)
+    async with aiosqlite.connect(database_path) as database:
+        database.row_factory = aiosqlite.Row
+        cursor = await database.execute(
+            """
+            SELECT k.id AS virtual_key_id, k.app_name,
+                   COUNT(u.id) AS requests,
+                   COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+                   COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd,
+                   COALESCE(SUM(u.cost_avoided_usd), 0) AS cost_avoided_usd,
+                   COALESCE(SUM(CASE WHEN u.cache_status = 'hit' THEN 1 ELSE 0 END), 0)
+                       AS cache_hits
+            FROM virtual_keys k
+            LEFT JOIN usage_logs u ON u.virtual_key_id = k.id
+            WHERE (? IS NULL OR k.id = ?)
+            GROUP BY k.id, k.app_name
+            ORDER BY k.id
+            """,
+            (virtual_key_id, virtual_key_id),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+    return [dict(row) for row in rows]
+
+
+# Returns stored usage rows for tests and administrative inspection.
 async def list_usage_log_records(
     database_path: Path = DATABASE_PATH,
 ) -> list[dict[str, object]]:

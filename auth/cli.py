@@ -5,6 +5,7 @@ import argparse
 
 # Runs asynchronous SQLite functions from this synchronous command-line entry point.
 import asyncio
+import json
 
 # Supplies the database operations used by each administrator command.
 from auth.database import (
@@ -12,6 +13,7 @@ from auth.database import (
     grant_provider_permission,
     list_virtual_key_records,
     revoke_virtual_key_record,
+    summarize_usage,
 )
 
 # Supplies secure generation, safe identification, and one-way hashing helpers.
@@ -79,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Requires the unambiguous database ID shown by the list command.
     revoke_parser.add_argument("--id", required=True, type=int, help="Key record ID.")
+
+    usage_parser = commands.add_parser("usage", help="Report all-time recorded usage per key.")
+    usage_parser.add_argument("--id", type=int, help="Only report this key record ID.")
+    usage_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
 
     # Returns the completed parser to the CLI entry point.
     return parser
@@ -197,6 +203,25 @@ async def revoke_key(record_id: int) -> None:
 
 # Routes parsed arguments to the matching asynchronous operation.
 async def run_command(arguments: argparse.Namespace) -> None:
+    if arguments.command == "usage":
+        records = await summarize_usage(arguments.id)
+        if arguments.json:
+            print(json.dumps(records, indent=2))
+        elif not records:
+            print("No matching virtual keys found.")
+        else:
+            print("All-time recorded usage (USD estimates; not provider invoices)")
+            print("ID | APP | REQUESTS | TOKENS | EST. USD | CACHE HITS | AVOIDED USD")
+            for record in records:
+                # JSON escaping prevents app labels from injecting terminal control codes.
+                app = json.dumps(record["app_name"], ensure_ascii=True)
+                print(
+                    f'{record["virtual_key_id"]} | {app} | {record["requests"]} | '
+                    f'{record["total_tokens"]} | {record["estimated_cost_usd"]:.8f} | '
+                    f'{record["cache_hits"]} | {record["cost_avoided_usd"]:.8f}'
+                )
+        return
+
     # Handles key issuance.
     if arguments.command == "create":
         # Passes administrator-supplied ownership and permission metadata.

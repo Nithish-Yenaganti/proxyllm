@@ -148,6 +148,18 @@ class VirtualKeyDatabaseTests(unittest.IsolatedAsyncioTestCase):
             legacy_database_path,
         )
 
+        # Confirms startup also adds the persistent sliding-window event table.
+        async with aiosqlite.connect(legacy_database_path) as database:
+            table_cursor = await database.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'rate_limit_events'
+                """
+            )
+            rate_limit_table = await table_cursor.fetchone()
+            await table_cursor.close()
+
         # Confirms the original provider authorization survived the migration.
         self.assertEqual(
             migrated_permission,
@@ -156,6 +168,7 @@ class VirtualKeyDatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "provider_credential": "default",
             },
         )
+        self.assertEqual(rate_limit_table, ("rate_limit_events",))
 
     # Confirms one active key can receive independent permissions for two providers.
     async def test_one_key_can_use_multiple_authorized_providers(self) -> None:

@@ -13,6 +13,7 @@ ProxyLLM is designed to provide:
 - one stable API for multiple LLM providers;
 - server-side ownership of real provider credentials;
 - revocable application-level virtual keys;
+- persistent per-key exact sliding-window request limiting;
 - explicit model routing and provider authorization;
 - normalized complete and streaming responses;
 - privacy-conscious usage, cost, and latency measurement; and
@@ -27,7 +28,7 @@ The current implementation does not attempt to provide:
 - automatic provider fallback or load balancing;
 - distributed caching or multi-region operation;
 - a high-availability database;
-- built-in rate limiting, quotas, or budget enforcement;
+- distributed rate limiting, quotas, or budget enforcement;
 - an administrative web API or user interface;
 - arbitrary provider URLs, credentials, or models supplied by clients;
 - semantic caching; or
@@ -65,7 +66,8 @@ The client controls the public model name and generation parameters. It does not
 | Component | Responsibility | Key files |
 | --- | --- | --- |
 | HTTP application | Owns request validation, routing, caching, response construction, and usage logging | `api/main.py` |
-| Authentication middleware | Validates bearer virtual keys and attaches safe key metadata to the request | `api/middleware.py` |
+| Authentication middleware | Validates bearer virtual keys, enforces their request limit, and attaches safe key metadata | `api/middleware.py` |
+| Rate-limit policy | Atomically consumes persistent rolling-window capacity per virtual key | `auth/rate_limit.py` |
 | Key administration | Creates, lists, grants permissions to, and revokes virtual keys | `auth/cli.py`, `auth/keys.py` |
 | Persistence | Initializes and queries the SQLite schema | `auth/database.py` |
 | Model registry | Maps allowed public model names to trusted providers, upstream models, and price snapshots | `providers/registry.py` |
@@ -86,6 +88,7 @@ The main request path is shown separately from the system overview so authentica
 flowchart TD
     Start([Receive chat request])
     Auth{Virtual key valid?}
+    RateLimit{Capacity remaining?}
     Validate{Request and model valid?}
     Permission{Provider permitted?}
     Configured{Credential and adapter configured?}
@@ -102,6 +105,7 @@ flowchart TD
     Return([Return complete response])
     StreamReturn([Stream response to client])
     Error401([401 authentication error])
+    Error429([429 rate-limit error])
     Error400([400 or 404 request error])
     Error403([403 authorization error])
     Error500([500 configuration error])
@@ -109,7 +113,9 @@ flowchart TD
 
     Start --> Auth
     Auth -->|no| Error401
-    Auth -->|yes| Validate
+    Auth -->|yes| RateLimit
+    RateLimit -->|yes| Validate
+    RateLimit -->|no| Error429
     Validate -->|no| Error400
     Validate -->|yes| Permission
     Permission -->|no| Error403
@@ -179,6 +185,7 @@ erDiagram
     virtual_keys ||--o{ virtual_key_provider_permissions : grants
     virtual_keys ||--o{ usage_logs : produces
     virtual_keys ||--o{ response_cache : owns
+    virtual_keys ||--o{ rate_limit_events : throttles
 
     virtual_keys {
         integer id PK
@@ -228,11 +235,18 @@ erDiagram
         real created_at_unix
         real expires_at_unix
     }
+
+    rate_limit_events {
+        integer id PK
+        integer virtual_key_id FK
+        real accepted_at_unix
+    }
 ```
 
 Database initialization enables write-ahead logging (WAL). Foreign-key enforcement and
 a five-second busy timeout are applied during initialization and on the request-path
-connections that authenticate, authorize, log usage, and read or write cache entries.
+connections that authenticate, rate-limit, authorize, log usage, and read or write
+cache entries.
 The schema is initialized and migrated during application startup.
 
 ### Data retention and privacy
@@ -300,11 +314,14 @@ Important safeguards include:
 - the plaintext virtual key is displayed only once at creation;
 - unknown and revoked keys return the same authentication response;
 - unauthorized provider access stops before an upstream call;
+- each authenticated key is limited to 24 protected requests in any rolling 60 seconds;
 - clients cannot submit arbitrary upstream URLs or credentials;
 - only selected safe upstream response headers cross the gateway; and
 - errors returned to clients do not include secrets or raw internal exceptions.
 
-Production deployments still need TLS termination, network access controls, rate limiting, secret management, database backup policy, log retention policy, and monitoring.
+Production deployments still need TLS termination, network access controls, budget
+quotas, distributed edge protection, secret management, database backup policy, log
+retention policy, and monitoring.
 
 ## 10. Error model and observability
 
@@ -316,13 +333,17 @@ The gateway presents stable OpenAI-style JSON error envelopes. Important status 
 | `401` | Missing, malformed, unknown, or revoked virtual key |
 | `403` | Valid key without permission for the routed provider |
 | `404` | Public model is not registered |
+| `429` | Authenticated virtual key exhausted its rolling 60-second capacity |
 | `500` | Trusted provider or adapter configuration is missing |
 | `502` | Upstream connection or protocol failure |
 
 Upstream HTTP errors that arrive as valid responses preserve the provider status code.
 Fireworks bodies pass through unchanged; Anthropic error bodies are normalized.
 
-Every authenticated chat request attempts to write one `usage_logs` record. Logging failures are isolated from successful provider responses. Cost values are estimates based on route-level price snapshots, not provider invoices.
+Every admitted authenticated chat request attempts to write one `usage_logs` record.
+Rate-limited requests stop in middleware and are represented by the limiter state rather
+than a usage row. Logging failures are isolated from successful provider responses. Cost
+values are estimates based on route-level price snapshots, not provider invoices.
 
 ## 11. Deployment model
 
@@ -393,13 +414,34 @@ explicit cleanup because expiry prevents reuse but does not remove rows.
 
 ### ADR-005: Treat observability as non-blocking
 
-**Decision:** Attempt to record one safe usage row per authenticated request without allowing logging failures to replace valid provider responses.
+**Decision:** Attempt to record one safe usage row per admitted authenticated request
+without allowing logging failures to replace valid provider responses.
 
 **Reason:** Accounting is valuable, but it is not part of response correctness for this development-focused gateway.
 
 **Operational cost:** A storage failure may create gaps in usage history and must be detected through application logs.
 
 **Dangerous to skip in production:** Alerting on persistence failures and reconciling gateway estimates against provider invoices.
+
+### ADR-006: Persist an exact per-key sliding-window request limit
+
+**Decision:** Allow at most 24 authenticated protected requests per virtual key during
+the preceding 60 seconds. Store accepted-request timestamps in SQLite and prune, count,
+and conditionally insert inside one immediate write transaction before route handling.
+
+**Reason:** The exact rolling policy survives process restarts and does not allow the
+double burst possible at a fixed-minute boundary. SQLite serializes the transaction
+across concurrent workers sharing the database. An exhausted request is rejected
+without inserting a timestamp.
+
+**Counting policy:** Cache hits and authenticated requests later rejected by route
+validation or authorization count. Requests that fail authentication do not count.
+Excess requests return `429` with `Retry-After` calculated from the oldest relevant
+accepted timestamp, do not insert an event, and do not reach route or provider work.
+
+**Scaling limit:** This is single-host admission control, not distributed abuse
+protection or a spend budget. Multiple hosts require a shared atomic store, and public
+deployments still need edge-level controls and per-key token/cost quotas.
 
 ## 13. Scaling and evolution triggers
 
@@ -413,7 +455,7 @@ Change the architecture in response to measured constraints, not anticipated fas
 | One provider becomes a reliability bottleneck | Add explicit retry and fallback policy with idempotency and cost controls |
 | Different teams independently own gateway subsystems | Consider service separation along established module boundaries |
 | Model catalog changes too frequently for deployments | Move routes to validated, versioned configuration with an audit trail |
-| Untrusted or internet-facing clients use the gateway | Add TLS, rate limits, quotas, structured audit logs, and stronger secret storage |
+| Untrusted or internet-facing clients use the gateway | Add TLS, distributed edge controls, spend quotas, structured audit logs, and stronger secret storage |
 
 ## 14. Adding a provider
 

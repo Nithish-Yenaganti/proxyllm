@@ -17,6 +17,7 @@ from auth.database import DATABASE_PATH, get_active_virtual_key_by_hash
 
 # Supplies cheap format checking and deterministic hashing for presented keys.
 from auth.keys import has_valid_key_format, hash_virtual_key
+from auth.rate_limit import REQUESTS_PER_WINDOW, consume_rate_limit
 
 
 # Creates the same generic authentication error for every rejected credential.
@@ -35,6 +36,26 @@ def unauthorized_response() -> JSONResponse:
         status_code=401,
         content=error_body,
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+# Returns a stable throttling response without revealing key metadata.
+def rate_limited_response(retry_after_seconds: int) -> JSONResponse:
+    error_body = {
+        "error": {
+            "message": (
+                f"This virtual API key is limited to {REQUESTS_PER_WINDOW} "
+                "requests in any 60-second period."
+            ),
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+        }
+    }
+
+    return JSONResponse(
+        status_code=429,
+        content=error_body,
+        headers={"Retry-After": str(retry_after_seconds)},
     )
 
 
@@ -100,6 +121,17 @@ class VirtualKeyAuthMiddleware(BaseHTTPMiddleware):
 
         # Makes safe authorization metadata available to the proxy route.
         request.state.virtual_key = key_record
+
+        # Counts every authenticated protected request, including invalid requests and
+        # cache hits, before route parsing or provider work can consume more resources.
+        rate_limit = await consume_rate_limit(
+            int(key_record["id"]),
+            self.database_path,
+        )
+
+        # An exhausted request does not add an accepted event or reach the route.
+        if not rate_limit.allowed:
+            return rate_limited_response(rate_limit.retry_after_seconds)
 
         # Continues to the requested endpoint after successful authentication.
         return await call_next(request)

@@ -8,6 +8,7 @@ ProxyLLM provides one controlled entry point for Fireworks and Anthropic models.
 
 - virtual API keys, so applications never receive the real provider credentials;
 - per-key provider permissions, stored in SQLite;
+- a persistent sliding limit of 24 authenticated requests per 60 seconds for each virtual key;
 - model-based routing through one OpenAI-compatible endpoint;
 - normal and Server-Sent Events (SSE) streaming responses;
 - usage, cost, latency, and outcome logging without storing prompts or answers;
@@ -26,7 +27,7 @@ ProxyLLM puts those concerns in one local gateway. Clients use a stable API and 
 - **Simpler client integration:** OpenAI-compatible clients can use one base URL while switching models through the `model` field.
 - **Fine-grained access:** each virtual key can be granted or denied access to individual providers.
 - **Easier provider changes:** routing and provider-specific translation stay in the gateway instead of every client.
-- **Useful cost visibility:** each authenticated chat request attempts to record tokens, estimated cost, latency, cache status, and outcome.
+- **Useful cost visibility:** each admitted authenticated chat request attempts to record tokens, estimated cost, latency, cache status, and outcome.
 - **Lower repeated-request cost:** eligible complete responses can be reused within the same virtual-key boundary.
 - **Measurable performance:** included benchmarks help validate overhead, cache effectiveness, and supported load.
 
@@ -40,7 +41,7 @@ ProxyLLM is useful for:
 - projects that need provider-independent streaming and response formats; and
 - engineers who want request-level usage and cost estimates without retaining user content.
 
-It is currently best suited to local development, prototypes, portfolio projects, and controlled internal deployments. It is not yet a complete production gateway: it has no provider fallback, distributed cache, high-availability database, management API, or built-in rate limiting.
+It is currently best suited to local development, prototypes, portfolio projects, and controlled internal deployments. It is not yet a complete production gateway: it has no provider fallback, distributed cache, high-availability database, management API, budget quotas, or distributed rate limiting.
 
 ## How it works
 
@@ -104,7 +105,8 @@ python -m auth.database
 
 Existing databases using the earlier single-provider key schema automatically copy each
 key's original provider into the provider-permission table. Initialization also creates
-the usage ledger and response cache and adds missing cache metrics to older usage tables.
+the usage ledger, response cache, and rate-limit state and adds missing cache metrics to
+older usage tables.
 
 ### 4. Create a virtual key
 
@@ -161,8 +163,26 @@ configure `ANTHROPIC_API_KEY` and grant that key the `anthropic` permission firs
   instead of being silently converted.
 - The Anthropic adapter currently omits sampling fields such as `temperature` and
   `top_p`; provider defaults apply even if those fields were present in the client body.
-- There is no retry, provider fallback, rate limiting, quota enforcement, or management
-  HTTP API.
+- There is no retry, provider fallback, budget/quota enforcement, distributed rate
+  limiting, or management HTTP API.
+
+## Per-key request limit
+
+Every authenticated virtual key may make 24 protected `/v1/*` requests during any
+rolling 60-second period. Accepted-request timestamps are stored in SQLite and updated
+atomically, so concurrent gateway workers sharing the same database enforce one
+combined limit without a burst when a wall-clock minute changes.
+
+The policy counts every successfully authenticated protected request before route
+handling. That includes cache hits and requests whose JSON, model, or provider
+authorization is later rejected. Missing, malformed, unknown, and revoked keys do not
+count because they never authenticate. Once a window contains 24 accepted requests,
+additional requests return `429` with `Retry-After`; rejected excess requests do not
+add a timestamp or reach a provider.
+Each accepted timestamp stops counting exactly 60 seconds later, so capacity returns
+gradually as earlier requests leave the rolling window.
+Because a `429` stops in middleware before the chat route, it does not create a
+`usage_logs` row; the persistent limiter events remain the source of its admission state.
 
 ## Test a normal request
 
@@ -201,11 +221,25 @@ Automated tests use temporary SQLite databases and in-memory HTTP providers, so 
 
 ## Usage logging
 
-Every authenticated chat request attempts to write one row containing the virtual-key ID, provider, public model, prompt tokens, cached prompt tokens, completion tokens, total tokens, estimated USD cost, total latency, outcome, HTTP status, and timestamp. Prompts, generated answers, plaintext virtual keys, and real provider credentials are never stored in this table. A logging failure is reported internally but does not replace the client response.
+Every admitted authenticated chat request attempts to write one row containing the virtual-key ID, provider, public model, prompt tokens, cached prompt tokens, completion tokens, total tokens, estimated USD cost, total latency, outcome, HTTP status, and timestamp. Prompts, generated answers, plaintext virtual keys, and real provider credentials are never stored in this table. A logging failure is reported internally but does not replace the client response.
 
 Streaming remains unbuffered: the gateway observes a copy of each SSE chunk and writes the row only after the stream completes, fails, or disconnects. Fireworks requests automatically include `stream_options.include_usage=true`, while Anthropic's translated final event already includes normalized token usage.
 
-There is no usage-reporting API or CLI yet. Inspect the safe ledger directly:
+View all-time usage per virtual key from the local terminal (no running server required):
+
+```bash
+python -m auth.cli usage
+python -m auth.cli usage --id 1
+python -m auth.cli usage --json
+```
+
+The report shows recorded requests, total tokens, estimated USD cost, cache hits,
+and estimated cost avoided. Separate keys remain separate even with the same app
+name; unused and revoked keys are included. Counts include recorded failures but
+exclude middleware rejections (including rate-limit responses) and failed log
+writes. Token totals include cached responses, so they are not billed-token totals.
+Costs are estimates, not invoices. No secrets or response content are displayed.
+There is no reporting HTTP endpoint yet. Inspect individual ledger rows with:
 
 ```bash
 sqlite3 auth/gateway.db \

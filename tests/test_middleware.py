@@ -152,6 +152,46 @@ class VirtualKeyMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         # Confirms immediate database lookup enforces revocation.
         self.assertEqual(response.status_code, 401)
 
+    # Confirms the middleware stops an authenticated key before route execution.
+    async def test_25th_authenticated_request_is_rate_limited(self) -> None:
+        # Public and failed-authentication requests do not consume this key's capacity.
+        await self.client.get("/")
+        await self.client.get(
+            "/v1/protected",
+            headers={"Authorization": "Bearer nk_unknown_y"},
+        )
+
+        # A valid key consumes capacity even when route handling later returns 404.
+        authenticated_missing_route = await self.client.get(
+            "/v1/not-configured",
+            headers={"Authorization": f"Bearer {self.virtual_key}"},
+        )
+
+        allowed_responses = [
+            await self.client.get(
+                "/v1/protected",
+                headers={"Authorization": f"Bearer {self.virtual_key}"},
+            )
+            for _ in range(23)
+        ]
+
+        rejected_response = await self.client.get(
+            "/v1/protected",
+            headers={"Authorization": f"Bearer {self.virtual_key}"},
+        )
+
+        self.assertEqual(authenticated_missing_route.status_code, 404)
+        self.assertTrue(
+            all(response.status_code == 200 for response in allowed_responses)
+        )
+        self.assertEqual(rejected_response.status_code, 429)
+        self.assertEqual(
+            rejected_response.json()["error"]["code"],
+            "rate_limit_exceeded",
+        )
+        self.assertGreaterEqual(int(rejected_response.headers["Retry-After"]), 1)
+        self.assertLessEqual(int(rejected_response.headers["Retry-After"]), 60)
+
 
 # Runs this test module directly when requested from the terminal.
 if __name__ == "__main__":
