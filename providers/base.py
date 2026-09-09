@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 # Sends asynchronous provider requests and exposes unbuffered response bodies.
 import httpx
+import anyio
 
 
 # Describes the asynchronous check used to stop work after a client disconnects.
@@ -145,7 +146,6 @@ async def forward_raw_stream(
     # Runs even when FastAPI cancels iteration during a downstream disconnect.
     finally:
         # Releases the upstream response and its network connection.
-        await provider_response.aclose()
-
-        # Releases the manually managed HTTPX client that owns the stream.
-        await provider_client.aclose()
+        with anyio.CancelScope(shield=True):
+            await provider_response.aclose()
+            await provider_client.aclose()

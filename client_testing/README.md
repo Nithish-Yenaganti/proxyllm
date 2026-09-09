@@ -3,7 +3,7 @@
 ## Sustained local HTTP smoke load
 
 ```bash
-python -m client_testing.http_load --clients 8 --seconds 30
+python -m client_testing.http_load --pooled --clients 8 --seconds 30 --output benchmarks/results/local-http-pooled.json
 ```
 
 Creates two separate Uvicorn subprocesses on temporary localhost ports: a mock
@@ -13,7 +13,10 @@ send complete, uncached requests at one request per key every three seconds;
 the normal limiter stays enabled. Both test subprocesses stop and temporary data
 is removed when the run ends. Your regular proxy is not stopped or modified.
 
-The report `benchmarks/results/local-http-load.json` records HTTP status counts,
+Use `--pooled` to match normal server connection reuse; omit it only to compare
+with the older per-request client behavior.
+
+The selected output report records HTTP status counts,
 successful responses per second, and successful latency percentiles. Repeat runs
 overwrite that report unless you supply `--output`. This is a paced stability
 check, not a saturation benchmark: offered traffic is approximately clients/3
@@ -40,7 +43,9 @@ bounded in-process application work, NOT sustained network/server capacity or
 real-provider performance. It excludes Uvicorn, TCP, TLS, and streaming behavior.
 Use `--levels 1 4 8 --requests-per-client 10 --output PATH` to customize the run.
 
-Run these from the repository root with the virtual environment activated and
+## Checks against your running proxy
+
+Run the following checks from the repository root with the virtual environment activated and
 the proxy running. These scripts do not start the server or issue keys.
 Set `PROXY_VIRTUAL_KEY` in your ignored `client_testing/.env`; for isolation set a different
 `PROXY_SECOND_VIRTUAL_KEY`. Never commit credentials. Use only a trusted proxy

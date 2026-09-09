@@ -6,7 +6,7 @@ Accepted and implemented for the current single-host ProxyLLM project.
 
 ## Decision
 
-Keep ProxyLLM as one FastAPI process and keep authentication, usage logs, and deterministic response caching in the existing SQLite database. Add standalone Python benchmark orchestration, a standard k6 HTTP load script, and a local OpenAI-compatible mock provider rather than adding another production service.
+Keep ProxyLLM as one FastAPI service and keep authentication, usage logs, and response caching in SQLite. Use standalone Python benchmarks, a k6 load script, and a local mock provider rather than adding another production service.
 
 ## Recommended stack
 
@@ -23,10 +23,9 @@ response, safe headers, original estimated cost, and one-hour reuse deadline.
 
 The hash covers the virtual-key ID and canonical JSON for model, messages, and request parameters after removing gateway-only cache control. Including the virtual-key ID intentionally prevents cross-application response leakage.
 
-Implementation note: cache eligibility is evaluated before provider translation. The
-current Anthropic adapter omits `temperature`, so `temperature: 0` eligibility does not
-by itself prove deterministic Anthropic sampling; callers that require a fresh result
-must send `cache: false`.
+Updated implementation note: the Anthropic adapter rejects untranslated settings,
+including `temperature`, before cache lookup. Use `cache: true` for explicit reuse
+or `cache: false` for a fresh call. Caching does not guarantee deterministic sampling.
 
 ## System boundaries
 

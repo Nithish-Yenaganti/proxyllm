@@ -1,7 +1,7 @@
 """Sustained localhost HTTP smoke load with separate mock and gateway processes."""
 import argparse
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, asynccontextmanager
 from functools import partial
 import json
 from pathlib import Path
@@ -20,7 +20,7 @@ from auth.keys import generate_virtual_key, get_key_prefix, hash_virtual_key
 from benchmarks.common import summarize_latencies, write_json_report
 
 
-def server(kind, path, port, provider_port):
+def server(kind, path, port, provider_port, pooled=False):
     if kind == "mock":
         from benchmarks.mock_provider import app
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
@@ -28,7 +28,16 @@ def server(kind, path, port, provider_port):
     from api import main as gateway
     from api.middleware import VirtualKeyAuthMiddleware
     from providers.fireworks import FireworksAdapter
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app):
+        if pooled:
+            from providers.connections import pooled_adapters
+            async with pooled_adapters() as adapters:
+                app.state.provider_adapters = adapters
+                yield
+        else:
+            yield
+    app = FastAPI(lifespan=lifespan)
     app.add_middleware(VirtualKeyAuthMiddleware, database_path=Path(path))
     app.add_api_route("/v1/chat/completions", gateway.chat_completions, methods=["POST"])
     with ExitStack() as stack:
@@ -50,7 +59,7 @@ def free_port():
         return sock.getsockname()[1]
 
 
-async def run(clients, seconds):
+async def run(clients, seconds, pooled=False):
     processes = []
     with tempfile.TemporaryDirectory(prefix="proxyllm-http-") as directory:
         path = Path(directory) / "test.db"
@@ -68,7 +77,7 @@ async def run(clients, seconds):
             for kind, port in [("mock", mock_port), ("gateway", proxy_port)]:
                 processes.append(subprocess.Popen([sys.executable, "-m", "client_testing.http_load",
                     "--serve", kind, "--database", str(path), "--port", str(port),
-                    "--provider-port", str(mock_port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                    "--provider-port", str(mock_port)] + (["--pooled"] if pooled else []), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 for port in (mock_port, proxy_port):
                     for _ in range(100):
@@ -102,7 +111,7 @@ async def run(clients, seconds):
                         await asyncio.sleep(max(0, min(began + 3, deadline) - perf_counter()))
                 await asyncio.gather(*(worker(key) for key in keys))
                 elapsed = perf_counter() - start
-                return {"benchmark": "paced_local_http", "clients": clients,
+                return {"benchmark": "paced_local_http", "pooled": pooled, "clients": clients,
                     "duration_seconds": elapsed, "statuses": statuses,
                     "successful_requests_per_second": len(latencies) / elapsed,
                     "successful_latency": summarize_latencies(latencies) if latencies else None,
@@ -124,17 +133,18 @@ def main():
     parser.add_argument("--clients", type=int, default=8)
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--output", default="benchmarks/results/local-http-load.json")
+    parser.add_argument("--pooled", action="store_true", help="Use application-owned provider connection pools.")
     parser.add_argument("--serve", choices=["mock", "gateway"], help=argparse.SUPPRESS)
     parser.add_argument("--database", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--provider-port", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.serve:
-        server(args.serve, args.database, args.port, args.provider_port)
+        server(args.serve, args.database, args.port, args.provider_port, args.pooled)
         return
     if not 1 <= args.clients <= 32 or not 3 <= args.seconds <= 300:
         parser.error("Use 1–32 clients and 3–300 seconds.")
-    report = asyncio.run(run(args.clients, args.seconds))
+    report = asyncio.run(run(args.clients, args.seconds, args.pooled))
     print(json.dumps(report, indent=2))
     write_json_report(report, args.output)
 

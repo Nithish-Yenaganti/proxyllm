@@ -14,6 +14,7 @@ from typing import Any
 
 # Sends buffered and streamed requests to Anthropic's Messages API.
 import httpx
+import anyio
 
 # Supplies the shared adapter contract, errors, containers, and HTTP helpers.
 from providers.base import (
@@ -71,7 +72,28 @@ def extract_text_content(content: object) -> str:
 
 
 # Converts one unified OpenAI-compatible request into Anthropic Messages JSON.
+def validate_anthropic_settings(body: dict[str, Any]) -> None:
+    supported = {"model", "messages", "max_tokens", "max_completion_tokens", "stream", "stop", "stream_options"}
+    unsupported = sorted(set(body) - supported)
+    if unsupported:
+        raise ProviderRequestError(
+            "This gateway's Anthropic adapter does not support these settings: "
+            + ", ".join(unsupported)
+            + ". Remove them or choose a compatible route."
+        )
+    if "max_tokens" in body and "max_completion_tokens" in body:
+        raise ProviderRequestError("Supply only one token-limit setting.")
+    if "stream" in body and not isinstance(body["stream"], bool):
+        raise ProviderRequestError("stream must be a boolean.")
+    if "stream_options" in body:
+        options = body["stream_options"]
+        if (not isinstance(options, dict) or set(options) - {"include_usage"}
+                or options.get("include_usage", True) is not True):
+            raise ProviderRequestError("Anthropic stream_options supports only include_usage=true.")
+
+
 def translate_anthropic_request(request: AdapterRequest) -> dict[str, Any]:
+    validate_anthropic_settings(request.body)
     # Reads the required conversation list from the public request body.
     messages = request.body.get("messages")
 
@@ -178,7 +200,7 @@ def translate_anthropic_request(request: AdapterRequest) -> dict[str, Any]:
         # Reports the two supported public representations.
         raise ProviderRequestError("stop must be a string or an array of strings.")
 
-    # Deliberately omits provider-specific or deprecated sampling parameters.
+    # Unsupported settings were explicitly rejected before translation.
     return provider_body
 
 
@@ -530,10 +552,9 @@ async def translate_anthropic_stream(
     # Runs even if Starlette cancels the generator after a client disconnect.
     finally:
         # Releases the Anthropic response stream and its network connection.
-        await provider_response.aclose()
-
-        # Releases the manually managed HTTPX client that owns the stream.
-        await provider_client.aclose()
+        with anyio.CancelScope(shield=True):
+            await provider_response.aclose()
+            await provider_client.aclose()
 
 
 # Adapts the gateway's OpenAI-compatible contract to Anthropic Messages.
@@ -566,7 +587,7 @@ class AnthropicAdapter:
 
         # Handles complete Anthropic responses without a streaming generator.
         if not stream_requested:
-            # Opens and automatically closes one short-lived provider client.
+            # Releases a borrowed pool handle, or closes an independently owned test client.
             async with self.client_factory() as provider_client:
                 # Converts provider network failures into a gateway-level exception.
                 try:
@@ -649,14 +670,22 @@ class AnthropicAdapter:
             # Lets the FastAPI layer produce the shared 502 error response.
             raise ProviderConnectionError from error
 
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await provider_client.aclose()
+            raise
+
         # Reads provider errors normally because Anthropic may return JSON before SSE.
         if provider_response.is_error:
             # Buffers only the small error body rather than a successful generation.
-            error_body = await provider_response.aread()
-
-            # Releases both manually managed resources before parsing the error.
-            await provider_response.aclose()
-            await provider_client.aclose()
+            try:
+                error_body = await provider_response.aread()
+            except httpx.RequestError as error:
+                raise ProviderConnectionError from error
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await provider_response.aclose()
+                    await provider_client.aclose()
 
             # Attempts to parse the documented Anthropic error envelope.
             try:

@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 # Sends buffered and streamed requests to the Fireworks HTTP API.
 import httpx
+import anyio
 
 # Supplies the shared adapter contract, response container, and network helpers.
 from providers.base import (
@@ -67,7 +68,7 @@ class FireworksAdapter:
 
         # Keeps the complete-response behavior used before Phase 3 and Phase 4.
         if not stream_requested:
-            # Opens and automatically closes one short-lived provider client.
+            # Releases a borrowed pool handle, or closes an independently owned test client.
             async with self.client_factory() as provider_client:
                 # Converts network failures into a provider-independent gateway error.
                 try:
@@ -118,17 +119,25 @@ class FireworksAdapter:
             # Lets the FastAPI layer create one provider-independent 502 response.
             raise ProviderConnectionError from error
 
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await provider_client.aclose()
+            raise
+
         # Reads error bodies normally because providers do not guarantee SSE for errors.
         if provider_response.is_error:
             # Buffers only the error response so it can be returned as normal JSON.
-            error_body = await provider_response.aread()
+            try:
+                error_body = await provider_response.aread()
+            except httpx.RequestError as error:
+                raise ProviderConnectionError from error
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await provider_response.aclose()
+                    await provider_client.aclose()
 
             # Copies safe headers after HTTPX has decoded the complete error body.
             error_headers = get_response_headers(provider_response)
-
-            # Releases both manually managed upstream resources immediately.
-            await provider_response.aclose()
-            await provider_client.aclose()
 
             # Preserves the existing OpenAI-compatible Fireworks error envelope.
             return AdapterResponse(

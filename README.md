@@ -11,37 +11,20 @@ ProxyLLM provides one controlled entry point for Fireworks and Anthropic models.
 - a persistent sliding limit of 24 authenticated requests per 60 seconds for each virtual key;
 - model-based routing through one OpenAI-compatible endpoint;
 - normal and Server-Sent Events (SSE) streaming responses;
-- usage, cost, latency, and outcome logging without storing prompts or answers;
+- usage, estimated cost, latency, and outcome logging without content in usage logs;
 - optional one-hour reuse of eligible repeated non-streaming responses; and
 - benchmark tools for measuring gateway overhead, cache savings, and load behavior.
 
-## Why does it exist?
-
-Using provider APIs directly becomes difficult when several applications, developers, or models share the same credentials. Provider-specific request formats spread into client code, credentials become harder to rotate safely, access is difficult to revoke per application, and usage is fragmented across services.
-
-ProxyLLM puts those concerns in one local gateway. Clients use a stable API and a revocable virtual key, while the gateway owns provider credentials, routing rules, permissions, and measurement.
-
-## How is it helpful?
-
-- **Safer credential management:** real Fireworks and Anthropic keys remain on the gateway.
-- **Simpler client integration:** OpenAI-compatible clients can use one base URL while switching models through the `model` field.
-- **Fine-grained access:** each virtual key can be granted or denied access to individual providers.
-- **Easier provider changes:** routing and provider-specific translation stay in the gateway instead of every client.
-- **Useful cost visibility:** each admitted authenticated chat request attempts to record tokens, estimated cost, latency, cache status, and outcome.
-- **Lower repeated-request cost:** eligible complete responses can be reused within the same virtual-key boundary.
-- **Measurable performance:** included benchmarks help validate overhead, cache effectiveness, and supported load.
-
 ## Who is it for?
 
-ProxyLLM is useful for:
+See the [future-work list](docs/future-work.md) for the bounded private-deployment
+finishing scope. Those tasks are planned, not implemented.
 
-- developers running local tools or AI applications against more than one provider;
-- small teams that need separate, revocable credentials for each application;
-- platform engineers evaluating a lightweight LLM gateway architecture;
-- projects that need provider-independent streaming and response formats; and
-- engineers who want request-level usage and cost estimates without retaining user content.
+Developers who want several apps to share one gateway without sharing real provider
+keys. Each app gets its own revocable key and provider permissions.
 
-It is currently best suited to local development, prototypes, portfolio projects, and controlled internal deployments. It is not yet a complete production gateway: it has no provider fallback, distributed cache, high-availability database, management API, budget quotas, or distributed rate limiting.
+This is a local prototype, not a public service. It has no user accounts, per-user
+provider-key storage, spending budgets, or production deployment guarantees.
 
 ## How it works
 
@@ -161,8 +144,11 @@ configure `ANTHROPIC_API_KEY` and grant that key the `anthropic` permission firs
   complete responses, errors, and SSE events are translated to or from the Messages API.
 - Anthropic tool calls, unsupported roles, and non-text content are rejected with `400`
   instead of being silently converted.
-- The Anthropic adapter currently omits sampling fields such as `temperature` and
-  `top_p`; provider defaults apply even if those fields were present in the client body.
+- The Anthropic adapter rejects untranslated settings such as `temperature` and
+  `top_p` with `400` before cache lookup. This is a gateway adapter limitation.
+  For Anthropic caching, use explicit `cache: true` without unsupported settings.
+- Normal application startup creates separate provider HTTP connection pools;
+  request and stream cleanup release responses, while shutdown closes the pools.
 - There is no retry, provider fallback, budget/quota enforcement, distributed rate
   limiting, or management HTTP API.
 
@@ -237,9 +223,11 @@ The report shows recorded requests, total tokens, estimated USD cost, cache hits
 and estimated cost avoided. Separate keys remain separate even with the same app
 name; unused and revoked keys are included. Counts include recorded failures but
 exclude middleware rejections (including rate-limit responses) and failed log
-writes. Token totals include cached responses, so they are not billed-token totals.
+writes. Cache hits record zero new provider tokens. Token totals reflect recorded
+provider usage, which may be incomplete when a stream fails.
 Costs are estimates, not invoices. No secrets or response content are displayed.
-There is no reporting HTTP endpoint yet. Inspect individual ledger rows with:
+A separate read-only [local dashboard](dashboard/README.md) provides a browser view;
+it is not a public admin API. Inspect individual usage rows with:
 
 ```bash
 sqlite3 auth/gateway.db \
@@ -254,14 +242,16 @@ Add `PROXY_VIRTUAL_KEY` to your ignored `.env`, start the gateway, and run paire
 
 ```bash
 python -m benchmarks.latency_overhead \
-  --requests 30 \
-  --warmups 3 \
+  --requests 5 \
+  --warmups 1 \
   --output benchmarks/results/latency.json
 ```
 
 The script alternates request order, reuses separate HTTP connections, and prints direct, gateway, and gateway-minus-direct p50/p95/p99 latency. It deliberately uses `temperature: 0.2`, so automatic caching cannot make gateway measurements look artificially fast.
 
-Do not describe a synthetic run as production evidence. Run this command against the real provider and the same gateway deployment before publishing performance claims.
+Start with an idle key and allow its rolling limit to recover between workloads.
+Small samples and provider jitter can produce negative measured overhead; that does
+not prove the proxy makes the provider faster. Do not describe a synthetic run as production evidence. Run this command against the real provider and the same gateway deployment before publishing performance claims.
 
 ## Response caching
 
@@ -287,17 +277,17 @@ X-Proxy-Cost-Avoided-USD: estimated provider cost avoided by a hit
 `ERROR` means an eligible successful response was returned but the cache write failed.
 A cache-read failure falls through to the provider path and is reported as `MISS`.
 
-The automatic `temperature: 0` rule applies before provider translation. Because the
-current Anthropic adapter does not forward `temperature`, use `"cache": false` for
-Anthropic requests that must always generate a fresh response; do not infer upstream
-determinism from cache eligibility alone.
+Anthropic settings are validated before cache lookup: `temperature` is rejected by
+this adapter. Use `cache: true` to opt in, or `cache: false` for a fresh call.
+Cache eligibility is not a guarantee that a model would repeat the same answer.
+If document contents change outside the request, the cache cannot detect that.
 
 `usage_logs.cache_status` records `hit`, `miss`, or `not_eligible`, and `usage_logs.cost_avoided_usd` records the estimated savings. Run a fresh repeated-query workload with:
 
 ```bash
 python -m benchmarks.cache_workload \
-  --unique-prompts 10 \
-  --repeats 5 \
+  --unique-prompts 2 \
+  --repeats 2 \
   --output benchmarks/results/cache.json
 ```
 
@@ -312,7 +302,10 @@ brew install k6
 k6 version
 ```
 
-Start with modest levels because real-provider load tests spend money, then sweep complete and streaming calls independently:
+The legacy k6 sweep uses one key and can quickly hit the 24-request limit. Do not
+interpret its rejected requests as provider capacity. Start with the isolated,
+no-cost Python checks in [client testing](client_testing/README.md). The command
+below is an advanced workload, not a recommended real-provider first run:
 
 ```bash
 python -m benchmarks.load_sweep \

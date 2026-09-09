@@ -72,13 +72,17 @@ The client controls the public model name and generation parameters. It does not
 | Persistence | Initializes and queries the SQLite schema | `auth/database.py` |
 | Model registry | Maps allowed public model names to trusted providers, upstream models, and price snapshots | `providers/registry.py` |
 | Provider contract | Defines provider-independent requests, responses, credentials, and errors | `providers/base.py` |
+| Connection pools | Reuses provider connections until application shutdown | `providers/connections.py` |
 | Fireworks adapter | Forwards an already OpenAI-compatible provider protocol | `providers/fireworks.py` |
 | Anthropic adapter | Translates OpenAI chat requests and Anthropic Messages responses in both complete and streaming modes | `providers/anthropic.py` |
 | Usage tracking | Normalizes token usage, estimates cost, and observes streams without buffering them | `usage/tracking.py` |
 | Response cache | Determines eligibility and builds privacy-scoped deterministic cache keys | `usage/cache.py` |
 | Measurement tools | Measure overhead, cache behavior, and load independently of the request path | `benchmarks/` |
 
-These are code boundaries inside one process, not independently deployed services.
+These gateway modules run in one service. The optional `dashboard/` is a separate
+localhost-only process that reads existing SQLite usage; it cannot manage keys or
+serve as a public administrator interface. `client_testing/` exercises the gateway
+without requiring a separate end-user app.
 
 ## 5. Request-processing flow
 
@@ -274,10 +278,9 @@ A request is eligible only when it is non-streaming and either:
 
 `"cache": false` always opts out. The gateway-only field is removed before provider translation.
 
-Eligibility is evaluated before provider translation. The Anthropic adapter currently
-omits `temperature`, so automatic eligibility from `temperature: 0` does not prove that
-Anthropic used deterministic sampling. Clients that require a fresh Anthropic result
-must opt out with `"cache": false`.
+Anthropic settings are validated before cache lookup. Unsupported fields, including
+`temperature`, return 400 instead of being dropped. Use explicit `cache: true` for
+Anthropic caching, or `cache: false` for fresh results.
 
 The cache key is:
 

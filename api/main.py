@@ -49,6 +49,7 @@ from providers.base import (
 
 # Resolves public model names, prices, and concrete provider implementations.
 from providers.registry import ModelRoute, get_model_route, get_provider_adapter
+from providers.connections import pooled_adapters
 
 # Applies safe cache eligibility, provider-field cleanup, and privacy-scoped hashing.
 from usage.cache import build_cache_key, build_provider_body, is_cache_eligible
@@ -286,8 +287,13 @@ async def lifespan(_app: FastAPI):
     # Creates and migrates the key and provider-permission tables when necessary.
     await initialize_database()
 
-    # Hands control to FastAPI for the lifetime of the running server.
-    yield
+    # Each application instance owns its pools and closes them at shutdown.
+    async with pooled_adapters() as adapters:
+        _app.state.provider_adapters = adapters
+        try:
+            yield
+        finally:
+            del _app.state.provider_adapters
 
 
 # Creates the Uvicorn-served application with database startup enabled.
@@ -457,7 +463,9 @@ async def chat_completions(request: Request):
         )
 
     # Resolves the concrete adapter selected by the trusted model route.
-    provider_adapter = get_provider_adapter(model_route.provider)
+    adapters = getattr(getattr(request.scope.get("app"), "state", None), "provider_adapters", None)
+    provider_adapter = (adapters.get(model_route.provider) if adapters is not None
+                        else get_provider_adapter(model_route.provider))
 
     # Handles an invalid server registry without treating it as a client mistake.
     if provider_adapter is None:
@@ -476,6 +484,19 @@ async def chat_completions(request: Request):
 
     # Removes the gateway-only cache flag before either hashing or provider translation.
     provider_body = build_provider_body(body)
+
+    # Validate before cache lookup so old cached responses cannot hide unsupported settings.
+    if model_route.provider == "anthropic":
+        from providers.anthropic import validate_anthropic_settings
+        try:
+            validate_anthropic_settings(provider_body)
+        except ProviderRequestError as error:
+            return await reject_request(
+                virtual_key_id=virtual_key_id, provider=model_route.provider,
+                model=requested_model, model_route=model_route, started_at=started_at,
+                status="invalid_request", status_code=400, message=str(error),
+                error_type="invalid_request_error", code="unsupported_request",
+            )
 
     # Allows caching only for complete responses with deterministic or explicit intent.
     cache_eligible = is_cache_eligible(body)
