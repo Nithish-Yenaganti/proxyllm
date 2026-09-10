@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # Protects every /v1/* route with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
+from api.request_body import RequestTooLarge, configured_body_limit, read_json_body
 
 # Supplies database initialization, authorization lookups, and usage persistence.
 from auth.database import (
@@ -67,14 +68,15 @@ from usage.tracking import (
 
 # Loads .env values into process memory without displaying or logging their contents.
 load_dotenv()
+MAX_REQUEST_BYTES = configured_body_limit(os.getenv("PROXY_MAX_REQUEST_BYTES", "5000000"))
 
 
 # Creates this module's internal logger without printing request bodies or secrets.
 logger = logging.getLogger(__name__)
 
 
-# Keeps deterministic cached responses for one hour before requiring fresh generation.
-CACHE_TTL_SECONDS = 3600
+# Makes eligible cached responses reusable for thirty minutes.
+CACHE_TTL_SECONDS = 1800
 
 
 # Maps authorized database references to real server-side provider configuration.
@@ -199,7 +201,12 @@ async def read_cached_response(cache_key: str) -> dict[str, object] | None:
     # Keeps cache infrastructure optional to core provider availability.
     try:
         # Rejects expired rows inside the same indexed SQLite query.
-        return await get_cached_response_record(cache_key, time())
+        now = time()
+        record = await get_cached_response_record(cache_key, now)
+        # Apply today's policy to older rows written with a longer expiry too.
+        if record is not None and now >= float(record["created_at_unix"]) + CACHE_TTL_SECONDS:
+            return None
+        return record
 
     # Logs safe cache diagnostics without exposing the hashed request or its content.
     except Exception:
@@ -325,7 +332,16 @@ async def chat_completions(request: Request):
     # Parses the OpenAI-compatible request body before model routing begins.
     try:
         # Converts incoming UTF-8 JSON into ordinary Python values.
-        body = await request.json()
+        body = await read_json_body(request, MAX_REQUEST_BYTES)
+
+    except RequestTooLarge:
+        return await reject_request(
+            virtual_key_id=virtual_key_id, provider=None, model=None,
+            model_route=None, started_at=started_at, status="invalid_request",
+            status_code=413,
+            message=f"Request body exceeds the {MAX_REQUEST_BYTES}-byte limit.",
+            error_type="invalid_request_error", code="request_too_large",
+        )
 
     # Handles malformed JSON without exposing an internal FastAPI exception.
     except (json.JSONDecodeError, UnicodeDecodeError):

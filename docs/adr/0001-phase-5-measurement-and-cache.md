@@ -19,7 +19,7 @@ Keep ProxyLLM as one FastAPI service and keep authentication, usage logs, and re
 
 `usage_logs` gains `cache_status` and `cost_avoided_usd`. `response_cache` stores a
 SHA-256 key, owning virtual-key ID, provider/model identity, complete successful
-response, safe headers, original estimated cost, and one-hour reuse deadline.
+response, safe headers, original estimated cost, and 30-minute reuse deadline.
 
 The hash covers the virtual-key ID and canonical JSON for model, messages, and request parameters after removing gateway-only cache control. Including the virtual-key ID intentionally prevents cross-application response leakage.
 

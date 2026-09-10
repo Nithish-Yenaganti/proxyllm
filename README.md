@@ -12,7 +12,7 @@ ProxyLLM provides one controlled entry point for Fireworks and Anthropic models.
 - model-based routing through one OpenAI-compatible endpoint;
 - normal and Server-Sent Events (SSE) streaming responses;
 - usage, estimated cost, latency, and outcome logging without content in usage logs;
-- optional one-hour reuse of eligible repeated non-streaming responses; and
+- optional 30-minute reuse of eligible repeated non-streaming responses; and
 - benchmark tools for measuring gateway overhead, cache savings, and load behavior.
 
 ## Who is it for?
@@ -154,6 +154,15 @@ configure `ANTHROPIC_API_KEY` and grant that key the `anthropic` permission firs
 
 ## Per-key request limit
 
+Chat request bodies have a separate **5 MB maximum (5,000,000 bytes)**, configurable
+with `PROXY_MAX_REQUEST_BYTES` in server configuration; restart after changing it.
+Around 1 MB is guidance only, not an enforced threshold. The limit includes the
+whole incoming JSON body, not headers or the answer. Larger bodies return `413`
+before routing or provider calls; no content is truncated. Actual chunks are counted
+even without a trustworthy Content-Length. Authentication and rate limiting happen
+first, so admitted oversized requests consume allowance and attempt a usage log.
+This does not cap parsed-memory expansion, total concurrency, or response size.
+
 Every authenticated virtual key may make 24 protected `/v1/*` requests during any
 rolling 60-second period. Accepted-request timestamps are stored in SQLite and updated
 atomically, so concurrent gateway workers sharing the same database enforce one
@@ -262,7 +271,7 @@ Caching is available only for non-streaming requests when either:
 
 The `cache` field belongs to ProxyLLM and is removed before forwarding. Entries are
 scoped to the virtual key and the complete canonical request body after that removal,
-preventing responses from crossing application boundaries. A row can be reused for one hour, but
+preventing responses from crossing application boundaries. A row can be reused for 30 minutes, but
 expired rows are only ignored by lookups; the current implementation does not purge
 them automatically.
 

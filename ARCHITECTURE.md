@@ -266,7 +266,7 @@ ProxyLLM stores hashes and operational metadata, not plaintext secrets or conver
 
 The response cache contains complete response bodies and is therefore sensitive local
 data even though entries cannot cross virtual-key boundaries. Responses stop being
-eligible for reuse after one hour, but expired rows are not currently deleted
+eligible for reuse after 30 minutes, but expired rows are not currently deleted
 automatically.
 
 ## 8. Cache design
@@ -288,7 +288,7 @@ The cache key is:
 SHA-256(virtual_key_id + canonical request JSON without the cache field)
 ```
 
-Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Only successful complete responses are stored, and lookups ignore an entry after its one-hour reuse window.
+Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Only successful complete responses are stored, and lookups ignore an entry after its 30-minute reuse window.
 
 The cache is fail-open: a cache read or write failure is logged, but it does not make an otherwise valid provider request fail. A failed read continues as a miss; a failed write returns the provider response with `X-Proxy-Cache: ERROR`.
 
