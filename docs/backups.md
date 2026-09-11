@@ -27,8 +27,26 @@ depends on the host and scheduler being available; it is not a deployment server
 service or a guaranteed hourly recovery point. Use a server-native scheduler when
 deploying. Failures must be investigated rather than assumed to be successful backups.
 
-Keep all snapshots for now: no automatic retention/deletion has been authorized.
-Watch disk use. These files include sensitive key hashes and cached answers; they
+Hourly snapshots now retain the newest three plus the latest snapshot from before
+today (using the host's local date). Normally that fourth point is from yesterday;
+if no run succeeded yesterday, the older fallback is preserved instead. No copy is
+invented for missed days. Pruning runs only after a new verified hourly snapshot,
+and verifies retained snapshots before deleting anything. A failed snapshot or
+verification leaves old backups intact. Concurrent backup runs are refused by a
+directory lock (macOS/Linux). Filesystem deletion failures can leave extra copies.
+
+The hourly scheduler uses:
+
+```bash
+.venv/bin/python -m auth.backup create --kind hourly
+```
+
+The default `create` command produces a protected maintenance snapshot, as does
+cache cleanup. Maintenance snapshots are never automatically pruned: keep them
+until the associated change is confirmed successful, then review them manually.
+Older `gateway-` snapshots have unknown purpose and are also left untouched.
+Thus three-plus-one is not a hard cap on all files. Watch disk use.
+These files include sensitive key hashes and cached answers; they
 are not encrypted. A same-disk backup does not protect against losing the machine
 or disk; protected off-machine storage and a retention policy remain future work.
 Verification materializes SQL dumps in memory, suitable for this small database;

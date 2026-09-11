@@ -18,6 +18,7 @@ ProxyLLM provides one controlled entry point for Fireworks and Anthropic models.
 ## Who is it for?
 
 Local recovery: [SQLite backup and restore checks](docs/backups.md).
+Maintenance: [manual expired-cache cleanup](docs/cache-cleanup.md).
 
 See the [decision and problem history](DECISIONS.md) for why the project changed,
 what was fixed, measured results, and remaining gaps across project tasks.
