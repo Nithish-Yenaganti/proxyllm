@@ -68,6 +68,7 @@ class PreparationTests(unittest.IsolatedAsyncioTestCase):
 
 class InspectionHTTPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch.object(main, 'PARAMETER_DROP_POLICY', {}))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / 'test.db'

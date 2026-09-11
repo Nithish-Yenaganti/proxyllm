@@ -35,7 +35,10 @@ class FireworksAdapter:
         self.client_factory = client_factory
 
     def prepare(self, request: AdapterRequest) -> dict[str, Any]:
-        provider_body = deepcopy(request.body)
+        from providers.parameters import apply_sampling_policy
+        provider_body, _ = apply_sampling_policy(
+            request.body, self.name, request.upstream_model, request.drop_sampling_params,
+        )
         provider_body["model"] = request.upstream_model
         if provider_body.get("stream") is True:
             options = provider_body.get("stream_options")

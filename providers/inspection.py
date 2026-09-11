@@ -19,8 +19,17 @@ def inspect_payload(
         "payload": None,
         "changes": [],
         "errors": [],
+        "dropped_parameters": [],
     }
     try:
+        from providers.parameters import apply_sampling_policy
+        _, dropped = apply_sampling_policy(
+            request.body, adapter.name, request.upstream_model, request.drop_sampling_params,
+        )
+        report["dropped_parameters"] = [
+            {"field": field, "reason": "Explicit administrator model policy"}
+            for field in dropped
+        ]
         payload = adapter.prepare(request)
     except ProviderRequestError as error:
         report.update(status="blocked", errors=[{

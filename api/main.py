@@ -51,6 +51,8 @@ from providers.base import (
 # Resolves public model names, prices, and concrete provider implementations.
 from providers.registry import ModelRoute, get_model_route, get_provider_adapter
 from providers.connections import pooled_adapters
+from providers.registry import MODEL_ROUTES
+from providers.parameters import apply_sampling_policy, load_drop_policy, resolve_drop_fields
 
 # Applies safe cache eligibility, provider-field cleanup, and privacy-scoped hashing.
 from usage.cache import build_cache_key, build_provider_body, is_cache_eligible
@@ -68,6 +70,7 @@ from usage.tracking import (
 
 # Loads .env values into process memory without displaying or logging their contents.
 load_dotenv()
+PARAMETER_DROP_POLICY = load_drop_policy(os.getenv("PROXY_DROP_SAMPLING_PARAMS", "{}"), MODEL_ROUTES)
 MAX_REQUEST_BYTES = configured_body_limit(os.getenv("PROXY_MAX_REQUEST_BYTES", "5000000"))
 
 
@@ -513,6 +516,9 @@ async def chat_completions(request: Request):
 
     # Removes the gateway-only cache flag before either hashing or provider translation.
     provider_body = build_provider_body(body)
+    drop_fields = resolve_drop_fields(
+        PARAMETER_DROP_POLICY, model_route.provider, model_route.upstream_model,
+    )
 
     if inspecting:
         from providers.inspection import inspect_payload
@@ -521,11 +527,24 @@ async def chat_completions(request: Request):
             upstream_model=model_route.upstream_model,
             credential=ProviderCredential(url=provider_url, api_key=provider_api_key),
             is_disconnected=request.is_disconnected,
+            drop_sampling_params=drop_fields,
         )
         report = inspect_payload(provider_adapter, inspection_request, original_body=body)
         return JSONResponse(
             report, status_code=200 if report["status"] == "prepared" else 400,
             headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        provider_body, _ = apply_sampling_policy(
+            provider_body, model_route.provider, model_route.upstream_model, drop_fields,
+        )
+    except ProviderRequestError as error:
+        return await reject(
+            virtual_key_id=virtual_key_id, provider=model_route.provider,
+            model=requested_model, model_route=model_route, started_at=started_at,
+            status="invalid_request", status_code=400, message=str(error),
+            error_type="invalid_request_error", code="unsupported_request",
         )
 
     # Validate before cache lookup so old cached responses cannot hide unsupported settings.
@@ -542,7 +561,10 @@ async def chat_completions(request: Request):
             )
 
     # Allows caching only for complete responses with deterministic or explicit intent.
-    cache_eligible = is_cache_eligible(body)
+    effective_cache_body = dict(provider_body)
+    if "cache" in body:
+        effective_cache_body["cache"] = body["cache"]
+    cache_eligible = is_cache_eligible(effective_cache_body)
 
     # Starts with the value used by streams and non-deterministic requests.
     cache_status = "not_eligible"
@@ -553,7 +575,10 @@ async def chat_completions(request: Request):
     # Checks persistent cached output before creating an outbound provider connection.
     if cache_eligible:
         # Includes the virtual-key owner to prevent cross-application response leakage.
-        cache_key = build_cache_key(virtual_key_id, provider_body)
+        cache_key = build_cache_key(virtual_key_id, {
+            "policy_version": 2, "provider": model_route.provider,
+            "upstream_model": model_route.upstream_model, "body": provider_body,
+        })
 
         # Reads one exact unexpired response or None for a normal miss.
         cached_response = await read_cached_response(cache_key)

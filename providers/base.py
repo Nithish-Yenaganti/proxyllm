@@ -56,6 +56,9 @@ class AdapterRequest:
     # Lets a streaming adapter stop promptly when the downstream app disconnects.
     is_disconnected: DisconnectCheck
 
+    # Trusted administrator policy, never read from the client's JSON body.
+    drop_sampling_params: frozenset[str] = frozenset()
+
 
 # Holds either one complete response body or one asynchronous stream of response bytes.
 @dataclass(frozen=True)

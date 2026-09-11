@@ -137,6 +137,10 @@ configure `ANTHROPIC_API_KEY` and grant that key the `anthropic` permission firs
 
 ## Provider behavior and limitations
 
+See [model parameter policy](docs/parameter-policy.md) for validated sampling
+settings and administrator-controlled removal across all clients. Strict rejection
+remains the default; no local environment configuration is changed automatically.
+
 - Fireworks already uses an OpenAI-compatible chat schema, so complete responses and
   successful SSE streams pass through without schema translation. The gateway replaces
   the public model alias and bearer key with trusted upstream values.

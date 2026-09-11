@@ -16,6 +16,7 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         writer = AsyncMock()
         adapter = RecordingAdapter('anthropic')
         with patch.object(main, 'get_provider_permission_for_key', AsyncMock(return_value={'provider_credential':'default'})), \
+             patch.object(main, 'PARAMETER_DROP_POLICY', {}), \
              patch.dict(main.PROVIDER_CREDENTIALS, {('anthropic','default'):{'api_key':'fake','url':'https://example.test'}}), \
              patch.object(main, 'get_provider_adapter', return_value=adapter), \
              patch.object(main, 'read_cached_response', cache), \

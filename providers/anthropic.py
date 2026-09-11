@@ -571,7 +571,12 @@ class AnthropicAdapter:
         self.client_factory = client_factory
 
     def prepare(self, request: AdapterRequest) -> dict[str, Any]:
-        return translate_anthropic_request(request)
+        from dataclasses import replace
+        from providers.parameters import apply_sampling_policy
+        effective, _ = apply_sampling_policy(
+            request.body, self.name, request.upstream_model, request.drop_sampling_params,
+        )
+        return translate_anthropic_request(replace(request, body=effective))
 
     # Translates, sends, and normalizes one authorized Anthropic request.
     async def send(self, request: AdapterRequest) -> AdapterResponse:
