@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 
 # Provides complete JSON responses and unbuffered streaming responses.
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from providers.concurrency import GatewayBusy, ProviderSlots, SlotStreamingResponse, limited_send
 
 # Protects every /v1/* route with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
@@ -294,6 +295,7 @@ def decode_cached_headers(serialized_headers: object) -> dict[str, str]:
 # Performs one-time asynchronous application startup work.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _app.state.provider_slots = ProviderSlots()
     # Creates and migrates the key and provider-permission tables when necessary.
     await initialize_database()
 
@@ -308,6 +310,7 @@ async def lifespan(_app: FastAPI):
 
 # Creates the Uvicorn-served application with database startup enabled.
 app = FastAPI(lifespan=lifespan)
+app.state.provider_slots = ProviderSlots()
 
 # Applies virtual-key authentication before protected routes execute.
 app.add_middleware(VirtualKeyAuthMiddleware)
@@ -671,7 +674,23 @@ async def chat_completions(request: Request):
     # Runs provider-specific translation and HTTP work behind the shared interface.
     try:
         # Receives one provider-independent response container from either adapter.
-        adapter_response = await provider_adapter.send(adapter_request)
+        owning_app = request.scope.get("app", app)
+        if not hasattr(owning_app.state, "provider_slots"):
+            owning_app.state.provider_slots = ProviderSlots()
+        adapter_response, release_slot = await limited_send(
+            owning_app.state.provider_slots, provider_adapter, adapter_request,
+        )
+
+    except GatewayBusy:
+        response = await reject(
+            virtual_key_id=virtual_key_id, provider=model_route.provider,
+            model=requested_model, model_route=model_route, started_at=started_at,
+            status="gateway_busy", status_code=503,
+            message="All provider slots are busy. Please try again shortly.",
+            error_type="server_error", code="gateway_busy", cache_status=cache_status,
+        )
+        response.headers["Retry-After"] = "2"
+        return response
 
     # Converts unsupported but well-formed translations into a client error.
     except ProviderRequestError as error:
@@ -756,7 +775,7 @@ async def chat_completions(request: Request):
             )
 
         # Starts the downstream response before consuming the provider's full body.
-        return StreamingResponse(
+        return SlotStreamingResponse(
             observe_stream(
                 adapter_response.body,
                 stream_observer,
@@ -764,6 +783,7 @@ async def chat_completions(request: Request):
             ),
             status_code=adapter_response.status_code,
             headers=adapter_response.headers,
+            release=release_slot,
         )
 
     # Extracts normalized token totals from the complete provider response body.

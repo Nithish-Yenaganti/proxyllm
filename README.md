@@ -1,378 +1,150 @@
 # ProxyLLM
 
-ProxyLLM is a self-hosted, OpenAI-compatible gateway for applications that use multiple large language model (LLM) providers. An application sends one familiar `/v1/chat/completions` request to ProxyLLM, and the gateway authenticates it, selects the configured provider, forwards the request, and returns a consistent response.
+One OpenAI-compatible endpoint for Fireworks and Anthropic. Apps use virtual keys;
+real provider credentials stay on the gateway server.
 
-## What does it do?
+This is a working local project being prepared for private deployment—not a
+production-ready public service.
 
-ProxyLLM provides one controlled entry point for Fireworks and Anthropic models. It includes:
+## What it does
 
-- virtual API keys, so applications never receive the real provider credentials;
-- per-key provider permissions, stored in SQLite;
-- a persistent sliding limit of 24 authenticated requests per 60 seconds for each virtual key;
-- model-based routing through one OpenAI-compatible endpoint;
-- normal and Server-Sent Events (SSE) streaming responses;
-- usage, estimated cost, latency, and outcome logging without content in usage logs;
-- optional 30-minute reuse of eligible repeated non-streaming responses; and
-- benchmark tools for measuring gateway overhead, cache savings, and load behavior.
-
-## Who is it for?
-
-Local recovery: [SQLite backup and restore checks](docs/backups.md).
-Maintenance: [manual expired-cache cleanup](docs/cache-cleanup.md).
-
-See the [decision and problem history](DECISIONS.md) for why the project changed,
-what was fixed, measured results, and remaining gaps across project tasks.
-
-See the [future-work list](docs/future-work.md) for the bounded private-deployment
-finishing scope. Those tasks are planned, not implemented.
-
-Developers who want several apps to share one gateway without sharing real provider
-keys. Each app gets its own revocable key and provider permissions.
-
-This is a local prototype, not a public service. It has no user accounts, per-user
-provider-key storage, spending budgets, or production deployment guarantees.
-
-## How it works
-
-```text
-OpenAI-compatible client
-        |
-        | Bearer virtual-key + requested model
-        v
-ProxyLLM authentication and permission check
-        |
-        | model route + server-side provider credential
-        v
-Fireworks or Anthropic
-        |
-        | normalized complete or streaming response
-        v
-Client + private usage record in SQLite
-```
-
-For system boundaries and design decisions, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For a file-by-file implementation explanation, see [`CODE_GUIDE.md`](CODE_GUIDE.md).
+- Checks virtual keys and per-key provider permissions.
+- Routes chat requests and streams OpenAI-style responses.
+- Reuses provider HTTP connections.
+- Limits each key to 24 authenticated requests per rolling 60 seconds.
+- Caps incoming request bodies at 5 MB by default.
+- Allows five active provider calls per process, waiting up to two seconds for a slot.
+- Optionally caches complete responses for 30 minutes, separately for each key.
+- Reports usage and estimated costs through a CLI and local dashboard.
+- Previews provider requests without making paid calls.
+- Creates verified SQLite backups and supports manual expired-cache cleanup.
 
 ## Quick start
 
-### 1. Install dependencies
+Use Python 3.10+; backup tooling targets macOS/Linux.
+Run commands from the project directory.
 
-Python 3.10 or newer is required.
+### 1. Install and configure
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
-
-### 2. Configure at least one provider
-
-If `.env` does not already exist, copy `.env.example` to the ignored local file, then
-fill in only the credentials you intend to use.
-
-```bash
 cp -n .env.example .env
 ```
 
-```text
-FIREWORK_API_KEY=...
-FIREWORK_URL=https://api.fireworks.ai/inference/v1/chat/completions
-ANTHROPIC_API_KEY=...
-ANTHROPIC_URL=https://api.anthropic.com/v1/messages
-```
+Edit `.env` with the provider credentials you need. For Fireworks, set
+`FIREWORK_API_KEY` and `FIREWORK_URL`; the example file contains the endpoint.
+Keep real keys out of client apps and Git. Restart after configuration changes.
 
-Never commit or display `.env`.
-
-Provider values are read when `api.main` is imported. Restart the gateway after changing
-them. `FIREWORK_URL` must be set for Fireworks; Anthropic uses its direct Messages URL
-when `ANTHROPIC_URL` is omitted.
-
-### 3. Initialize or migrate SQLite
+### 2. Create a virtual key
 
 ```bash
 python -m auth.database
-```
-
-Existing databases using the earlier single-provider key schema automatically copy each
-key's original provider into the provider-permission table. Initialization also creates
-the usage ledger, response cache, and rate-limit state and adds missing cache metrics to
-older usage tables.
-
-### 4. Create a virtual key
-
-```bash
-# Create a key with its first Fireworks permission.
 python -m auth.cli create --app my-app --provider fireworks
 ```
 
-The complete virtual key is displayed only once when it is created.
-
-### 5. Run the gateway
-
-```bash
-uvicorn api.main:app --reload
-```
-
-The gateway is now available at `http://127.0.0.1:8000`.
-
-## Virtual-key management
-
-Use the CLI to inspect permissions, add another provider, or revoke a key:
+Save the virtual key displayed once by the command. To allow Anthropic too,
+configure `ANTHROPIC_API_KEY` and grant access using your actual key ID:
 
 ```bash
-# Safely list key IDs, prefixes, status, and provider permissions.
 python -m auth.cli list
-
-# Grant an existing key access to Anthropic.
 python -m auth.cli grant --id 1 --provider anthropic --credential default
-
-# Revoke the complete key and all of its provider access.
-python -m auth.cli revoke --id 1
 ```
 
-## Configured public models
-
-```text
-accounts/fireworks/models/deepseek-v4-flash-0731
-fireworks/deepseek-v4-flash
-anthropic/claude-sonnet-5
-claude-sonnet-5
-```
-
-The quick-start key can use the two Fireworks names. To use either Anthropic name,
-configure `ANTHROPIC_API_KEY` and grant that key the `anthropic` permission first.
-
-## Provider behavior and limitations
-
-See [model parameter policy](docs/parameter-policy.md) for validated sampling
-settings and administrator-controlled removal across all clients. Strict rejection
-remains the default; no local environment configuration is changed automatically.
-
-- Fireworks already uses an OpenAI-compatible chat schema, so complete responses and
-  successful SSE streams pass through without schema translation. The gateway replaces
-  the public model alias and bearer key with trusted upstream values.
-- Anthropic text messages, system/developer instructions, token limits, stop sequences,
-  complete responses, errors, and SSE events are translated to or from the Messages API.
-- Anthropic tool calls, unsupported roles, and non-text content are rejected with `400`
-  instead of being silently converted.
-- The Anthropic adapter rejects untranslated settings such as `temperature` and
-  `top_p` with `400` before cache lookup. This is a gateway adapter limitation.
-  For Anthropic caching, use explicit `cache: true` without unsupported settings.
-- Normal application startup creates separate provider HTTP connection pools;
-  request and stream cleanup release responses, while shutdown closes the pools.
-- There is no retry, provider fallback, budget/quota enforcement, distributed rate
-  limiting, or management HTTP API.
-
-## Per-key request limit
-
-Chat request bodies have a separate **5 MB maximum (5,000,000 bytes)**, configurable
-with `PROXY_MAX_REQUEST_BYTES` in server configuration; restart after changing it.
-Around 1 MB is guidance only, not an enforced threshold. The limit includes the
-whole incoming JSON body, not headers or the answer. Larger bodies return `413`
-before routing or provider calls; no content is truncated. Actual chunks are counted
-even without a trustworthy Content-Length. Authentication and rate limiting happen
-first, so admitted oversized requests consume allowance and attempt a usage log.
-This does not cap parsed-memory expansion, total concurrency, or response size.
-
-Every authenticated virtual key may make 24 protected `/v1/*` requests during any
-rolling 60-second period. Accepted-request timestamps are stored in SQLite and updated
-atomically, so concurrent gateway workers sharing the same database enforce one
-combined limit without a burst when a wall-clock minute changes.
-
-The policy counts every successfully authenticated protected request before route
-handling. That includes cache hits and requests whose JSON, model, or provider
-authorization is later rejected. Missing, malformed, unknown, and revoked keys do not
-count because they never authenticate. Once a window contains 24 accepted requests,
-additional requests return `429` with `Retry-After`; rejected excess requests do not
-add a timestamp or reach a provider.
-Each accepted timestamp stops counting exactly 60 seconds later, so capacity returns
-gradually as earlier requests leave the rolling window.
-Because a `429` stops in middleware before the chat route, it does not create a
-`usage_logs` row; the persistent limiter events remain the source of its admission state.
-
-## Inspect a request before sending
-
-`POST /v1/inspect` uses the same adapter preparation as real calls to preview the
-provider payload and report validation errors without contacting the provider.
-It enforces existing access controls and rate limits, and never touches the response
-cache or usage ledger. `prepared` means local preparation succeeded; upstream
-acceptance remains unverified. See the [inspection guide](docs/inspection.md) for
-curl examples and a cost-free runnable demo.
-
-## Test a normal request
+### 3. Start the gateway
 
 ```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_VIRTUAL_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "fireworks/deepseek-v4-flash",
-    "messages": [{"role": "user", "content": "Reply with hello"}],
-    "max_tokens": 100
-  }'
+python -m uvicorn api.main:app --reload
 ```
 
-## Test a streaming request
+Local address: `http://127.0.0.1:8000`. Stop with Control-C.
+Reload is for development, not deployment.
 
-```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_VIRTUAL_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "fireworks/deepseek-v4-flash",
-    "messages": [{"role": "user", "content": "Count from one to five"}],
-    "stream": true,
-    "max_tokens": 150
-  }'
-```
+### 4. Connect your app
 
-## Run automated tests
+For an OpenAI-compatible client, use:
 
-```bash
-python -m unittest discover -s tests -v
-```
+| Setting | Value |
+|---|---|
+| API base URL | `http://127.0.0.1:8000/v1` |
+| API key | Your virtual key, not a provider key |
+| Fireworks model | `fireworks/deepseek-v4-flash` |
+| Anthropic model | `anthropic/claude-sonnet-5` |
 
-Automated tests use temporary SQLite databases and in-memory HTTP providers, so they do not read real keys or spend provider credit.
+Your key must have permission for the selected provider. See
+[client testing](client_testing/README.md) for Python checks and request examples.
+Real-provider calls may cost money.
 
-## Usage logging
+## Important behavior
 
-Every admitted authenticated chat request attempts to write one row containing the virtual-key ID, provider, public model, prompt tokens, cached prompt tokens, completion tokens, total tokens, estimated USD cost, total latency, outcome, HTTP status, and timestamp. Prompts, generated answers, plaintext virtual keys, and real provider credentials are never stored in this table. A logging failure is reported internally but does not replace the client response.
+- **Settings:** Unsupported Anthropic settings are rejected by default.
+  Administrators can explicitly allow sampling-field removal by provider or model;
+  no default temperature is inserted. See [parameter policy](docs/parameter-policy.md).
+- **Compatibility:** Anthropic supports the adapter's text-chat features, not every
+  OpenAI feature. Unsupported tools and non-text content are rejected.
+- **Cache:** Non-streaming only. `cache: true` opts in; `cache: false` opts out.
+  Otherwise, effective temperature zero enables it. A removed temperature cannot
+  enable caching. Expiry stops reuse; it does not prove an answer is still correct.
+- **Privacy:** Usage logs omit prompts and answers, but response-cache rows and
+  database backups contain answers. Keep databases and backups private.
+- **Limits:** Cache hits and inspection count toward the rate limit. Excess requests
+  return 429; oversized bodies return 413. Configure the body cap through
+  `PROXY_MAX_REQUEST_BYTES` (default 5,000,000 bytes).
+- **Inspection:** `/v1/inspect` previews preparation without contacting a provider.
+  It does not prove upstream acceptance. See [inspection](docs/inspection.md).
 
-Streaming remains unbuffered: the gateway observes a copy of each SSE chunk and writes the row only after the stream completes, fails, or disconnects. Fireworks requests automatically include `stream_options.include_usage=true`, while Anthropic's translated final event already includes normalized token usage.
-
-View all-time usage per virtual key from the local terminal (no running server required):
+## Usage and tests
 
 ```bash
 python -m auth.cli usage
-python -m auth.cli usage --id 1
-python -m auth.cli usage --json
+python -m unittest discover -s tests -v
 ```
 
-The report shows recorded requests, total tokens, estimated USD cost, cache hits,
-and estimated cost avoided. Separate keys remain separate even with the same app
-name; unused and revoked keys are included. Counts include recorded failures but
-exclude middleware rejections (including rate-limit responses) and failed log
-writes. Cache hits record zero new provider tokens. Token totals reflect recorded
-provider usage, which may be incomplete when a stream fails.
-Costs are estimates, not invoices. No secrets or response content are displayed.
-A separate read-only [local dashboard](dashboard/README.md) provides a browser view;
-it is not a public admin API. Inspect individual usage rows with:
+Costs are estimates, not invoices. Middleware rejections and failed usage writes
+are not included in the normal usage report. The [local dashboard](dashboard/README.md)
+provides a read-only browser view; keep it localhost-only.
+
+Use [client-testing instructions](client_testing/README.md) for checks and
+benchmarks. Start with isolated mocks before paid runs. Small samples and mock
+workloads are not production-capacity evidence; the legacy k6 sweep also has a
+known report-freshness risk recorded in [project history](DECISIONS.md).
+
+## Backup and cleanup
 
 ```bash
-sqlite3 auth/gateway.db \
-  "SELECT virtual_key_id, provider, model, total_tokens, estimated_cost_usd, cache_status, cost_avoided_usd, latency_ms, status, created_at FROM usage_logs ORDER BY id DESC;"
+# Create and verify a protected backup before maintenance.
+python -m auth.backup create
+
+# Preview only: no deletion.
+python -m auth.cache_cleanup
+
+# Explicitly back up first, then delete expired cache rows.
+python -m auth.cache_cleanup --delete
 ```
 
-Cost estimates use price snapshots stored beside each model route: DeepSeek V4 Flash (0731) is configured at $0.22 input, $0.007 cached-input, and $0.66 output per million tokens; Claude Sonnet 5 is configured at $2 input and $10 output per million tokens. These values are estimates rather than invoices or a claim that the snapshot is still the provider's current price. Review `providers/registry.py` when provider prices or serving tiers change.
+Hourly retention keeps three recent snapshots plus one prior-day recovery point.
+Maintenance and older unclassified backups stay protected. Hourly execution is
+configured through the maintainer's local task automation—it is **not installed
+by cloning this repository**. Cleanup is manual.
 
-## Latency overhead benchmark
+See [backups](docs/backups.md) and [cleanup](docs/cache-cleanup.md) for details.
+Same-disk backups do not protect against disk loss. Secrets, databases, backups,
+and local benchmark reports are excluded from Git.
 
-Add `PROXY_VIRTUAL_KEY` to your ignored `.env`, start the gateway, and run paired direct-provider and gateway requests:
+## What's next?
 
-```bash
-python -m benchmarks.latency_overhead \
-  --requests 5 \
-  --warmups 1 \
-  --output benchmarks/results/latency.json
-```
+Private deployment still needs HTTPS and restricted access, automatic restart,
+broader resource/spending controls, monitoring, and tested operational recovery.
+The concurrency limit is per process: use one worker for a five-call total.
+Busy requests receive 503 with retry guidance; cache hits and inspection use no
+provider slot. Long streams hold a slot until completion or disconnect.
+See [future work](docs/future-work.md) for the bounded finishing scope.
 
-The script alternates request order, reuses separate HTTP connections, and prints direct, gateway, and gateway-minus-direct p50/p95/p99 latency. It deliberately uses `temperature: 0.2`, so automatic caching cannot make gateway measurements look artificially fast.
+## Documentation
 
-Start with an idle key and allow its rolling limit to recover between workloads.
-Small samples and provider jitter can produce negative measured overhead; that does
-not prove the proxy makes the provider faster. Do not describe a synthetic run as production evidence. Run this command against the real provider and the same gateway deployment before publishing performance claims.
-
-## Response caching
-
-Caching is available only for non-streaming requests when either:
-
-- `temperature` is explicitly `0`, unless `"cache": false` opts out; or
-- the application explicitly sends `"cache": true`.
-
-The `cache` field belongs to ProxyLLM and is removed before forwarding. Entries are
-scoped to the virtual key and the complete canonical request body after that removal,
-preventing responses from crossing application boundaries. A row can be reused for 30 minutes, but
-expired rows are only ignored by lookups; the current implementation does not purge
-them automatically.
-
-Complete responses expose measurement headers; streaming responses do not:
-
-```text
-X-Proxy-Cache: HIT | MISS | BYPASS | ERROR
-X-Proxy-Estimated-Cost-USD: provider estimate for a new complete response
-X-Proxy-Cost-Avoided-USD: estimated provider cost avoided by a hit
-```
-
-`ERROR` means an eligible successful response was returned but the cache write failed.
-A cache-read failure falls through to the provider path and is reported as `MISS`.
-
-Anthropic settings are validated before cache lookup: `temperature` is rejected by
-this adapter. Use `cache: true` to opt in, or `cache: false` for a fresh call.
-Cache eligibility is not a guarantee that a model would repeat the same answer.
-If document contents change outside the request, the cache cannot detect that.
-
-`usage_logs.cache_status` records `hit`, `miss`, or `not_eligible`, and `usage_logs.cost_avoided_usd` records the estimated savings. Run a fresh repeated-query workload with:
-
-```bash
-python -m benchmarks.cache_workload \
-  --unique-prompts 2 \
-  --repeats 2 \
-  --output benchmarks/results/cache.json
-```
-
-The script adds a unique run namespace so the first round is a real miss, then reports cache hit rate and estimated provider spend avoided together.
-
-## Load test
-
-Install k6 on macOS and verify it:
-
-```bash
-brew install k6
-k6 version
-```
-
-The legacy k6 sweep uses one key and can quickly hit the 24-request limit. Do not
-interpret its rejected requests as provider capacity. Start with the isolated,
-no-cost Python checks in [client testing](client_testing/README.md). The command
-below is an advanced workload, not a recommended real-provider first run:
-
-```bash
-python -m benchmarks.load_sweep \
-  --levels 10,25,50 \
-  --stage-duration 10s \
-  --p95-limit-ms 2000 \
-  --error-rate-limit 0.01 \
-  --mode both \
-  --output benchmarks/results/load-sweep.json
-```
-
-The wrapper runs `benchmarks/load_test.js` once per concurrency level and response mode,
-then reports the highest level actually tested where p95 and error rate both stayed
-below your thresholds. Caching is explicitly disabled during load tests. The k6 script
-reads its endpoint from `GATEWAY_URL`, which is separate from the `PROXY_GATEWAY_URL`
-used by the Python latency and cache scripts. Streaming mode exercises the SSE request
-path but measures whole-response latency; it does not measure time to first token or
-inter-token timing.
-
-## Cost-free tooling check with the mock provider
-
-The synthetic provider verifies commands without using provider credit; its results are development evidence, not real-provider performance numbers. The gateway must already have a Fireworks-authorized virtual key in `PROXY_VIRTUAL_KEY`.
-
-```bash
-# Terminal 1
-uvicorn benchmarks.mock_provider:app --port 9001
-
-# Terminal 2: exported values override .env without displaying it
-FIREWORK_URL=http://127.0.0.1:9001/v1/chat/completions \
-FIREWORK_API_KEY=mock-secret \
-uvicorn api.main:app --port 8000
-
-# Terminal 3
-FIREWORK_URL=http://127.0.0.1:9001/v1/chat/completions \
-FIREWORK_API_KEY=mock-secret \
-python -m benchmarks.latency_overhead --requests 20
-```
-
-Export `MOCK_PROVIDER_DELAY_MS` before starting the mock provider to control delay,
-`MOCK_PROVIDER_RESPONSE_TOKENS` to control reported completion tokens, or
-`MOCK_PROVIDER_FAIL_EVERY` to return a deterministic 500 on every Nth request. The mock
-provider reads these from its process environment and does not load `.env` itself.
+- [Architecture](ARCHITECTURE.md): components and request flow.
+- [Code guide](CODE_GUIDE.md): file-by-file explanations.
+- [Decision history](DECISIONS.md): choices, fixes, measurements, and gaps.
+- [Deployment guide](docs/deployment-guide.md): local steps and remaining deployment work.
+- [Learning journal](docs/learning-journal.md) and [failure log](docs/failure-log.md): actual exercises and results.
