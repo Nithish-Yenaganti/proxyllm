@@ -78,6 +78,9 @@ class ProviderAdapter(Protocol):
     # Names the provider so the registry and diagnostics can identify the adapter.
     name: str
 
+    def prepare(self, request: AdapterRequest) -> dict[str, Any]:
+        """Build the outbound JSON body without network access or input mutation."""
+
     # Sends one authorized request and returns a unified response container.
     async def send(self, request: AdapterRequest) -> AdapterResponse:
         """Translate, send, and normalize one provider request."""

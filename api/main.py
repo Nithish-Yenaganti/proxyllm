@@ -314,12 +314,25 @@ app.add_middleware(VirtualKeyAuthMiddleware)
 @app.get("/")
 def read_root():
     # Returns a small health response without requiring authentication.
-    return {"message": "Hello, World!"}
+    return {"message": "This is ProxyLLM, successfully running!"}
 
 
 # Accepts the unified OpenAI-compatible endpoint used by every client application.
 @app.post("/v1/chat/completions")
+@app.post("/v1/inspect")
 async def chat_completions(request: Request):
+    inspecting = request.url.path == "/v1/inspect"
+
+    async def reject(**details):
+        if inspecting:
+            response = gateway_error(
+                details["status_code"], details["message"],
+                details["error_type"], details["code"],
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        return await reject_request(**details)
+
     # Starts latency measurement before parsing, routing, and provider work.
     started_at = perf_counter()
 
@@ -335,7 +348,7 @@ async def chat_completions(request: Request):
         body = await read_json_body(request, MAX_REQUEST_BYTES)
 
     except RequestTooLarge:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id, provider=None, model=None,
             model_route=None, started_at=started_at, status="invalid_request",
             status_code=413,
@@ -345,7 +358,7 @@ async def chat_completions(request: Request):
 
     # Handles malformed JSON without exposing an internal FastAPI exception.
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
             model=None,
@@ -360,7 +373,7 @@ async def chat_completions(request: Request):
 
     # Requires a JSON object because adapters read named request fields.
     if not isinstance(body, dict):
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
             model=None,
@@ -378,7 +391,7 @@ async def chat_completions(request: Request):
 
     # Requires one non-empty model name before consulting the explicit registry.
     if not isinstance(requested_model, str) or requested_model == "":
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
             model=None,
@@ -396,7 +409,7 @@ async def chat_completions(request: Request):
 
     # Rejects unknown models rather than guessing a provider from their name.
     if model_route is None:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
             model=requested_model,
@@ -417,7 +430,7 @@ async def chat_completions(request: Request):
 
     # Rejects a valid key that lacks authorization for the selected provider.
     if provider_permission is None:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,
@@ -441,7 +454,7 @@ async def chat_completions(request: Request):
 
     # Rejects database permissions that have no matching server configuration.
     if provider_config is None:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,
@@ -465,7 +478,7 @@ async def chat_completions(request: Request):
         or not isinstance(provider_api_key, str)
         or provider_api_key == ""
     ):
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,
@@ -485,7 +498,7 @@ async def chat_completions(request: Request):
 
     # Handles an invalid server registry without treating it as a client mistake.
     if provider_adapter is None:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,
@@ -501,13 +514,27 @@ async def chat_completions(request: Request):
     # Removes the gateway-only cache flag before either hashing or provider translation.
     provider_body = build_provider_body(body)
 
+    if inspecting:
+        from providers.inspection import inspect_payload
+        inspection_request = AdapterRequest(
+            body=provider_body, public_model=requested_model,
+            upstream_model=model_route.upstream_model,
+            credential=ProviderCredential(url=provider_url, api_key=provider_api_key),
+            is_disconnected=request.is_disconnected,
+        )
+        report = inspect_payload(provider_adapter, inspection_request, original_body=body)
+        return JSONResponse(
+            report, status_code=200 if report["status"] == "prepared" else 400,
+            headers={"Cache-Control": "no-store"},
+        )
+
     # Validate before cache lookup so old cached responses cannot hide unsupported settings.
     if model_route.provider == "anthropic":
         from providers.anthropic import validate_anthropic_settings
         try:
             validate_anthropic_settings(provider_body)
         except ProviderRequestError as error:
-            return await reject_request(
+            return await reject(
                 virtual_key_id=virtual_key_id, provider=model_route.provider,
                 model=requested_model, model_route=model_route, started_at=started_at,
                 status="invalid_request", status_code=400, message=str(error),
@@ -623,7 +650,7 @@ async def chat_completions(request: Request):
 
     # Converts unsupported but well-formed translations into a client error.
     except ProviderRequestError as error:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,
@@ -639,7 +666,7 @@ async def chat_completions(request: Request):
 
     # Converts DNS, TLS, connection, timeout, and invalid upstream responses to 502.
     except ProviderConnectionError:
-        return await reject_request(
+        return await reject(
             virtual_key_id=virtual_key_id,
             provider=model_route.provider,
             model=requested_model,

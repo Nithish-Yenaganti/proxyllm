@@ -179,6 +179,15 @@ gradually as earlier requests leave the rolling window.
 Because a `429` stops in middleware before the chat route, it does not create a
 `usage_logs` row; the persistent limiter events remain the source of its admission state.
 
+## Inspect a request before sending
+
+`POST /v1/inspect` uses the same adapter preparation as real calls to preview the
+provider payload and report validation errors without contacting the provider.
+It enforces existing access controls and rate limits, and never touches the response
+cache or usage ledger. `prepared` means local preparation succeeded; upstream
+acceptance remains unverified. See the [inspection guide](docs/inspection.md) for
+curl examples and a cost-free runnable demo.
+
 ## Test a normal request
 
 ```bash

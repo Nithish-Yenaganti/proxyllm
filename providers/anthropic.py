@@ -570,10 +570,13 @@ class AnthropicAdapter:
         # Keeps client construction outside translation and routing logic.
         self.client_factory = client_factory
 
+    def prepare(self, request: AdapterRequest) -> dict[str, Any]:
+        return translate_anthropic_request(request)
+
     # Translates, sends, and normalizes one authorized Anthropic request.
     async def send(self, request: AdapterRequest) -> AdapterResponse:
         # Converts the unified request into the Anthropic Messages schema.
-        provider_body = translate_anthropic_request(request)
+        provider_body = self.prepare(request)
 
         # Uses the direct HTTP authentication and version headers Anthropic requires.
         provider_headers = {

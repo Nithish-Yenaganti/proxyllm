@@ -4,6 +4,9 @@
 from collections.abc import Callable
 
 # Sends buffered and streamed requests to the Fireworks HTTP API.
+from copy import deepcopy
+from typing import Any
+
 import httpx
 import anyio
 
@@ -31,40 +34,24 @@ class FireworksAdapter:
         # Keeps client construction outside request translation and routing logic.
         self.client_factory = client_factory
 
-    # Sends one request while preserving OpenAI-compatible request and response shapes.
-    async def send(self, request: AdapterRequest) -> AdapterResponse:
-        # Copies the caller body so replacing its model cannot mutate shared state.
-        provider_body = dict(request.body)
-
-        # Replaces the public alias with the trusted real Fireworks model identifier.
+    def prepare(self, request: AdapterRequest) -> dict[str, Any]:
+        provider_body = deepcopy(request.body)
         provider_body["model"] = request.upstream_model
+        if provider_body.get("stream") is True:
+            options = provider_body.get("stream_options")
+            provider_body["stream_options"] = {
+                **(options if isinstance(options, dict) else {}),
+                "include_usage": True,
+            }
+        return provider_body
 
-        # Builds headers using the real provider key selected after authorization.
+    async def send(self, request: AdapterRequest) -> AdapterResponse:
+        provider_body = self.prepare(request)
         provider_headers = {
             "Authorization": f"Bearer {request.credential.api_key}",
             "Content-Type": "application/json",
         }
-
-        # Selects streaming only for the literal JSON boolean true.
         stream_requested = provider_body.get("stream") is True
-
-        # Requests the final usage-bearing SSE event needed by Phase 5.1 accounting.
-        if stream_requested:
-            # Reads caller options only when they use the documented object shape.
-            stream_options = provider_body.get("stream_options")
-
-            # Copies existing options so the original incoming body remains untouched.
-            normalized_stream_options = (
-                dict(stream_options)
-                if isinstance(stream_options, dict)
-                else {}
-            )
-
-            # Always includes usage because gateway accounting depends on final totals.
-            normalized_stream_options["include_usage"] = True
-
-            # Sends the provider an ordinary OpenAI-compatible stream options object.
-            provider_body["stream_options"] = normalized_stream_options
 
         # Keeps the complete-response behavior used before Phase 3 and Phase 4.
         if not stream_requested:
