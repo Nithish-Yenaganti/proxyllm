@@ -579,7 +579,7 @@ async def chat_completions(request: Request):
     if cache_eligible:
         # Includes the virtual-key owner to prevent cross-application response leakage.
         cache_key = build_cache_key(virtual_key_id, {
-            "policy_version": 2, "provider": model_route.provider,
+            "policy_version": 3, "provider": model_route.provider,
             "upstream_model": model_route.upstream_model, "body": provider_body,
         })
 

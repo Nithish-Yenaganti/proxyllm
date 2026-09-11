@@ -83,6 +83,8 @@ Real-provider calls may cost money.
   no default temperature is inserted. See [parameter policy](docs/parameter-policy.md).
 - **Compatibility:** Anthropic supports the adapter's text-chat features, not every
   OpenAI feature. Unsupported tools and non-text content are rejected.
+  If the client omits its output limit, Anthropic requests use 2,048 tokens;
+  an explicit client limit takes precedence. This does not guarantee completion.
 - **Cache:** Non-streaming only. `cache: true` opts in; `cache: false` opts out.
   Otherwise, effective temperature zero enables it. A removed temperature cannot
   enable caching. Expiry stops reuse; it does not prove an answer is still correct.

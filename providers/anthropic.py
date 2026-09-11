@@ -31,7 +31,7 @@ from providers.base import (
 ANTHROPIC_API_VERSION = "2023-06-01"
 
 # Supplies a conservative output limit when an OpenAI-style request omits one.
-DEFAULT_MAX_TOKENS = 1024
+DEFAULT_MAX_TOKENS = 2048
 
 
 # Converts supported OpenAI message content into plain text for Anthropic.
