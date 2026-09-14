@@ -20,6 +20,7 @@ htmlcov/
 
 # Local benchmark evidence can contain machine, endpoint, and workload details
 benchmarks/results/*.json
+benchmarks/results/**/*.json
 
 # Packaging and build output
 build/

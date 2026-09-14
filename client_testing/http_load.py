@@ -4,6 +4,7 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from functools import partial
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -18,6 +19,7 @@ from fastapi import FastAPI
 from auth import database
 from auth.keys import generate_virtual_key, get_key_prefix, hash_virtual_key
 from benchmarks.common import summarize_latencies, write_json_report
+from benchmarks.evidence import provenance, measure_request
 
 
 def server(kind, path, port, provider_port, pooled=False):
@@ -50,6 +52,7 @@ def server(kind, path, port, provider_port, pooled=False):
         stack.enter_context(patch.object(gateway, "PROVIDER_CREDENTIALS", {
             ("fireworks", "default"): {"url": f"http://127.0.0.1:{provider_port}/v1/chat/completions",
                                        "api_key": "mock-only"}}))
+        stack.enter_context(patch.object(gateway, "PARAMETER_DROP_POLICY", {}))
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
 
 
@@ -59,7 +62,8 @@ def free_port():
         return sock.getsockname()[1]
 
 
-async def run(clients, seconds, pooled=False):
+async def run(clients, seconds, pooled=False, *, interval=3.0, stream=False,
+              cache_every=0, delay_ms=25):
     processes = []
     with tempfile.TemporaryDirectory(prefix="proxyllm-http-") as directory:
         path = Path(directory) / "test.db"
@@ -77,7 +81,10 @@ async def run(clients, seconds, pooled=False):
             for kind, port in [("mock", mock_port), ("gateway", proxy_port)]:
                 processes.append(subprocess.Popen([sys.executable, "-m", "client_testing.http_load",
                     "--serve", kind, "--database", str(path), "--port", str(port),
-                    "--provider-port", str(mock_port)] + (["--pooled"] if pooled else []), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                    "--provider-port", str(mock_port)] + (["--pooled"] if pooled else []),
+                    env={**os.environ, 'MOCK_PROVIDER_DELAY_MS': str(delay_ms),
+                         'MOCK_PROVIDER_FAIL_EVERY':'0', 'MOCK_PROVIDER_RESPONSE_TOKENS':'8'},
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 for port in (mock_port, proxy_port):
                     for _ in range(100):
@@ -90,32 +97,44 @@ async def run(clients, seconds, pooled=False):
                             await asyncio.sleep(0.1)
                     else:
                         raise RuntimeError("Isolated server startup timed out.")
-                statuses, latencies = {}, []
+                statuses, latencies, samples = {}, [], []
                 start = perf_counter()
                 deadline = start + seconds
                 async def worker(key):
+                    sequence = 0
                     while perf_counter() < deadline:
                         began = perf_counter()
-                        try:
-                            r = await client.post(f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
-                                headers={"Authorization": "Bearer " + key}, json={
-                                    "model": "fireworks/deepseek-v4-flash", "cache": False,
-                                    "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 16})
-                            code = str(r.status_code)
-                        except httpx.HTTPError:
-                            code = "transport_error"
+                        repeated = bool(cache_every and sequence % cache_every == 0)
+                        sample = await measure_request(client,
+                            f"http://127.0.0.1:{proxy_port}/v1/chat/completions",
+                            {"Authorization": "Bearer " + key}, {
+                                "model": "fireworks/deepseek-v4-flash", "cache": bool(cache_every),
+                                "stream": stream, "messages": [{"role":"user", "content":
+                                "repeat fixture" if repeated else f"unique fixture {sequence}"}], "max_tokens":16})
+                        sequence += 1
+                        samples.append(sample)
+                        code = sample['status']
                         statuses[code] = statuses.get(code, 0) + 1
-                        if code == "200":
-                            latencies.append((perf_counter() - began) * 1000)
+                        if code == "200" and sample['complete']:
+                            latencies.append(sample['total_ms'])
                         # One call per key per three seconds stays below 24/minute.
-                        await asyncio.sleep(max(0, min(began + 3, deadline) - perf_counter()))
+                        await asyncio.sleep(max(0, min(began + interval, deadline) - perf_counter()))
                 await asyncio.gather(*(worker(key) for key in keys))
                 elapsed = perf_counter() - start
-                return {"benchmark": "paced_local_http", "pooled": pooled, "clients": clients,
+                ttft = [s['ttft_ms'] for s in samples if s['complete'] and s['ttft_ms'] is not None]
+                return {"benchmark": "local_http", "provenance":provenance(),
+                    "pooled": pooled, "clients": clients, "interval_seconds":interval,
+                    "stream":stream, "cache_every":cache_every, "mock_delay_ms":delay_ms,
+                    "provider_concurrency_limit":5, "slot_wait_seconds":2,
+                    "rate_limit_per_key":24, "rate_window_seconds":60,
+                    "samples": samples, "attempted":len(samples), "successful":len(latencies),
+                    "incomplete_200":sum(s['status']=='200' and not s['complete'] for s in samples),
+                    "cache_hits":sum(s['cache']=='HIT' for s in samples),
+                    "ttft":summarize_latencies(ttft) if ttft else None,
                     "duration_seconds": elapsed, "statuses": statuses,
                     "successful_requests_per_second": len(latencies) / elapsed,
                     "successful_latency": summarize_latencies(latencies) if latencies else None,
-                    "limitations": "Paced complete-response smoke load, not maximum capacity. Local mock, no TLS or real provider. Three-second per-key interval; real limiter enabled."}
+                    "limitations": "Local mock, no TLS or real provider; closed-loop workers and per-key rate limiting constrain throughput. TTFT measures first content delta, not headers. Synthetic cache mix is not real application traffic. Includes drain time; no maximum-capacity claim."}
         finally:
             for process in processes:
                 if process.poll() is None:
@@ -134,6 +153,10 @@ def main():
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--output", default="benchmarks/results/local-http-load.json")
     parser.add_argument("--pooled", action="store_true", help="Use application-owned provider connection pools.")
+    parser.add_argument('--interval', type=float, default=3)
+    parser.add_argument('--stream', action='store_true')
+    parser.add_argument('--cache-every', type=int, default=0, help='Repeat one prompt every N requests per key; others are unique (0 disables cache).')
+    parser.add_argument('--delay-ms', type=int, default=25)
     parser.add_argument("--serve", choices=["mock", "gateway"], help=argparse.SUPPRESS)
     parser.add_argument("--database", help=argparse.SUPPRESS)
     parser.add_argument("--port", type=int, help=argparse.SUPPRESS)
@@ -144,7 +167,12 @@ def main():
         return
     if not 1 <= args.clients <= 32 or not 3 <= args.seconds <= 300:
         parser.error("Use 1–32 clients and 3–300 seconds.")
-    report = asyncio.run(run(args.clients, args.seconds, args.pooled))
+    if not 0 <= args.interval <= 60 or not 0 <= args.cache_every <= 100 or not 0 <= args.delay_ms <= 5000:
+        parser.error('Invalid interval, cache mix, or mock delay.')
+    if args.stream and args.cache_every:
+        parser.error('Cache workloads must be non-streaming.')
+    report = asyncio.run(run(args.clients, args.seconds, args.pooled,
+        interval=args.interval, stream=args.stream, cache_every=args.cache_every, delay_ms=args.delay_ms))
     print(json.dumps(report, indent=2))
     write_json_report(report, args.output)
 

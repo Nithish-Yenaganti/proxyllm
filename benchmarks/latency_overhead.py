@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 import os
 
 # Measures complete HTTP response duration with a monotonic clock.
-from time import perf_counter
+from time import perf_counter, sleep
+from benchmarks.evidence import provenance
 
 # Sends pooled direct and gateway requests under the same local process conditions.
 import httpx
@@ -75,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Allows a versioned local report without requiring one for quick runs.
     parser.add_argument("--output")
+    parser.add_argument("--pair-pause", type=float, default=3.0,
+                        help="Pause between pairs to leave room below the per-key rate limit.")
 
     # Returns the configured parser to the entry point.
     return parser
@@ -106,7 +109,7 @@ def time_request(
 # Runs warmups and alternating paired measurements using two persistent connections.
 def run_benchmark(arguments: argparse.Namespace) -> dict[str, object]:
     # Rejects sample sizes that cannot produce meaningful percentile output.
-    if arguments.requests < 1 or arguments.warmups < 0:
+    if arguments.requests < 1 or arguments.warmups < 0 or getattr(arguments, 'pair_pause', 3) < 0:
         # Stops before any billable request is made.
         raise SystemExit("--requests must be positive and --warmups cannot be negative.")
 
@@ -151,6 +154,7 @@ def run_benchmark(arguments: argparse.Namespace) -> dict[str, object]:
     ):
         # Warms DNS, TLS, connection pools, gateway imports, and model serving.
         for _ in range(arguments.warmups):
+            sleep(getattr(arguments, 'pair_pause', 3))
             # Runs the pair back to back without including it in reported numbers.
             time_request(
                 direct_client,
@@ -167,6 +171,7 @@ def run_benchmark(arguments: argparse.Namespace) -> dict[str, object]:
 
         # Alternates pair order to reduce systematic first-or-second request bias.
         for index in range(arguments.requests):
+            sleep(getattr(arguments, 'pair_pause', 3))
             # Runs direct first on even iterations.
             if index % 2 == 0:
                 # Records provider baseline then gateway measurement.
@@ -223,6 +228,10 @@ def run_benchmark(arguments: argparse.Namespace) -> dict[str, object]:
     # Builds a reproducible report without any secret header values.
     return {
         "benchmark": "latency_overhead",
+        "provenance": provenance(),
+        "pair_pause_seconds": getattr(arguments, 'pair_pause', 3),
+        "paired_delta_ms": [round(g-d, 3) for d, g in zip(direct_samples, gateway_samples)],
+        "limitations": "Percentile differences are not paired-delta percentiles; provider/network variation can produce negative differences. Small samples do not establish tail latency or a speedup.",
         "measured_at": datetime.now(timezone.utc).isoformat(),
         "requests_per_path": arguments.requests,
         "warmups_per_path": arguments.warmups,

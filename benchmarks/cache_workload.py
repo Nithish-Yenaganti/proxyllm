@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 # Reads safe endpoint defaults and generates an isolated workload namespace.
 import os
 import uuid
+from time import sleep
+from benchmarks.evidence import provenance
 
 # Sends repeated OpenAI-compatible requests to the running gateway.
 import httpx
@@ -29,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Measure ProxyLLM cache hit rate and estimated spend avoided."
     )
+    parser.add_argument('--request-pause', type=float, default=3.0,
+                        help='Pause before each request to avoid exhausting the per-key limit.')
 
     # Controls how many different request keys appear in one workload.
     parser.add_argument("--unique-prompts", type=int, default=10)
@@ -126,6 +130,7 @@ def run_workload(arguments: argparse.Namespace) -> dict[str, object]:
         for _round_number in range(arguments.repeats):
             # Sends each distinct request once per round.
             for prompt in prompts:
+                sleep(max(0, getattr(arguments, 'request_pause', 0)))
                 # Builds a deterministic complete request with explicit cache consent.
                 body = {
                     "model": arguments.model,
@@ -206,6 +211,7 @@ def run_workload(arguments: argparse.Namespace) -> dict[str, object]:
 
     # Returns a secret-free report suitable for long-term comparison.
     return {
+        "provenance": provenance(),
         "benchmark": "cache_workload",
         "measured_at": datetime.now(timezone.utc).isoformat(),
         "workload_id": workload_id,

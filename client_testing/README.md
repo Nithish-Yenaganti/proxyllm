@@ -88,6 +88,13 @@ python -m client_testing.check_client rate-limit --model unused
 python -m auth.cli usage
 ```
 
+## Repeatable local evidence
+
+Run `.venv/bin/python -m client_testing.evidence_suite` from the repository root.
+This uses only temporary local mock servers, saves fresh reports, and checks
+multiple client counts, streaming timing and a mixed cache workload.
+See [the benchmark plan](../docs/benchmark-improvement-plan.md) for scope and limits.
+
 ## Saved benchmarks
 
 The wrappers reuse existing benchmarks rather than copying measurement logic.
