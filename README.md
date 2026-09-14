@@ -1,5 +1,8 @@
 # ProxyLLM
 
+The goal is to let apps use different model providers without each app managing
+separate provider credentials and access rules.
+
 ProxyLLM lets an app call Fireworks or Anthropic through one OpenAI-compatible API.
 The app uses a virtual key; the proxy checks its permissions and keeps the real
 provider keys on the server.
