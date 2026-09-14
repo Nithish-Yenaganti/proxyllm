@@ -10,20 +10,32 @@ provider keys on the server.
 Built with Python, FastAPI and SQLite. Tested locally with both providers;
 not deployed or ready for public use.
 
-## ProxyLLM or direct provider calls?
+## Two ways to call the same providers
+
+The providers generate the answers in both cases. ProxyLLM adds a shared place
+to manage app access, limits and usage.
 
 | | Through ProxyLLM | Direct to a provider |
 |---|---|---|
-| App integration | One OpenAI-compatible API for supported features | Use each provider's API or SDK |
-| Credentials | Apps use virtual keys; provider keys stay in the proxy | Your app's backend manages provider credentials |
-| Access and usage | Per-key permissions, limits and combined usage reporting | Use provider controls or implement your own |
-| Response caching | Optional, per-key cache in SQLite | Add your own response cache if needed |
-| Features | Limited to what the adapters support | Access the provider's full API |
-| Operation | Another service to run, with extra processing and a network hop | Fewer moving parts; no proxy overhead |
+| Integration | One API for features the adapters support | Use the provider's API or SDK directly |
+| Key management | Each app gets a virtual key with provider permissions | Each app's backend manages its provider credentials |
+| Usage reporting | Combined per-app records across both providers | Provider reports or reporting built into your app |
+| Operational overhead | Run the proxy as well as your app; adds a network hop | No extra gateway to operate |
 
-Direct calls are simpler for one provider. ProxyLLM is useful when several apps
-need shared access rules and reporting across providers. Provider-side limits
-still apply either way; provider prompt caching differs from this response cache.
+Provider-side limits still apply either way; provider prompt caching differs
+from this response cache.
+
+## Why use ProxyLLM?
+
+Use it when you want to:
+
+- Connect several apps to Fireworks and Anthropic through the same API.
+- Give each app its own key and revoke its access without changing other apps' keys.
+- Manage provider permissions, request limits and usage reporting in one place.
+- Reuse eligible responses instead of paying for the same provider request again.
+
+For a single app using one provider, direct calls may be simpler. This project
+demonstrates these controls locally; it is not a managed or production-ready service.
 
 ## What it does
 
