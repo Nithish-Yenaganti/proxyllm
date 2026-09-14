@@ -10,6 +10,21 @@ provider keys on the server.
 Built with Python, FastAPI and SQLite. Tested locally with both providers;
 not deployed or ready for public use.
 
+## ProxyLLM or direct provider calls?
+
+| | Through ProxyLLM | Direct to a provider |
+|---|---|---|
+| App integration | One OpenAI-compatible API for supported features | Use each provider's API or SDK |
+| Credentials | Apps use virtual keys; provider keys stay in the proxy | Your app's backend manages provider credentials |
+| Access and usage | Per-key permissions, limits and combined usage reporting | Use provider controls or implement your own |
+| Response caching | Optional, per-key cache in SQLite | Add your own response cache if needed |
+| Features | Limited to what the adapters support | Access the provider's full API |
+| Operation | Another service to run, with extra processing and a network hop | Fewer moving parts; no proxy overhead |
+
+Direct calls are simpler for one provider. ProxyLLM is useful when several apps
+need shared access rules and reporting across providers. Provider-side limits
+still apply either way; provider prompt caching differs from this response cache.
+
 ## What it does
 
 - Routes chat and streaming requests, reusing provider connections.
