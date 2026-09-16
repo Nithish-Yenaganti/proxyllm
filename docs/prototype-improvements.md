@@ -28,6 +28,11 @@ cannot conceal unsupported settings. For Anthropic cache opt-in use cache=true
 without temperature; the proxy removes its private cache flag before validation.
 This intentionally changes requests that previously silently dropped parameters.
 
+Later update: administrators can explicitly configure sampling-field removal
+before validation. Strict rejection remains the default; see
+[parameter policy](parameter-policy.md). The older description above does not
+override that policy, and a removed temperature cannot enable caching.
+
 ## Verification
 
 The black-and-white dashboard was opened in a browser and its refresh action

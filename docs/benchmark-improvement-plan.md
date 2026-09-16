@@ -8,7 +8,9 @@ Goal: make measurements repeatable and honest, not make numbers look bigger.
 | 2 | Run isolated load at 1, 5 and 10 clients, streaming first-content timing, and a mixed cache workload | Free local suite using temporary databases and mock provider | Stop test processes; live data is untouched |
 | 3 | Collect larger real-provider paired samples with agreed spending allowance | Repeat on the same configuration; compare distributions and failures | Stop measurements; no application changes |
 
-Phases 1–2 are implemented here; phase 3 requires approval for paid calls.
+Phases 1–2 are implemented and locally exercised. A bounded real run completed
+ten measured pairs per provider; see [results](real-provider-check-results.md).
+Larger paid runs still require approval and are not needed to finish the local demo.
 
 ## Free local run
 
@@ -40,4 +42,5 @@ mock delay, streaming or cache mix; count rejected requests separately.
 For real latency runs, keep model, output allowance and cache behavior equal, pace requests
 below the key limit, alternate direct/gateway order, and collect multiple runs before claiming a gain.
 Small-sample p95/p99 values and negative apparent overhead are not proof the proxy accelerates the provider.
-Real provider runs, memory profiling and a sustained capacity ceiling remain follow-up work.
+Larger real-provider samples, memory profiling and a sustained capacity ceiling
+remain optional follow-up work; the completed small run does not establish those.

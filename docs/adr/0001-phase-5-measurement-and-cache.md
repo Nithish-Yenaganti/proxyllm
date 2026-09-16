@@ -23,9 +23,10 @@ response, safe headers, original estimated cost, and 30-minute reuse deadline.
 
 The hash covers the virtual-key ID and canonical JSON for model, messages, and request parameters after removing gateway-only cache control. Including the virtual-key ID intentionally prevents cross-application response leakage.
 
-Updated implementation note: the Anthropic adapter rejects untranslated settings,
-including `temperature`, before cache lookup. Use `cache: true` for explicit reuse
-or `cache: false` for a fresh call. Caching does not guarantee deterministic sampling.
+Updated implementation note: Anthropic validation runs before cache lookup, after
+any explicitly configured sampling-field removal. Strict rejection remains the
+default; see [parameter policy](../parameter-policy.md). Use `cache: true` for
+explicit reuse or `cache: false` for a fresh call. Caching does not guarantee freshness.
 
 ## System boundaries
 
@@ -55,8 +56,8 @@ This design reuses the existing deployable components, produces inspectable meas
 
 SQLite needs no separate server, but every eligible request adds one cache lookup and
 successful cacheable responses add one write. Expiry prevents reuse but does not delete
-a row, so cache bodies continue consuming local disk until an operator or future
-maintenance command removes expired entries.
+a row, so cache bodies remain until the operator runs the implemented
+[manual cleanup command](../cache-cleanup.md), which backs up before deletion.
 
 Real latency, cache, and load workloads consume provider credit. The mock provider verifies mechanics at zero provider cost, but synthetic numbers must never be presented as production measurements.
 

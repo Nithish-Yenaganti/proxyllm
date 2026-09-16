@@ -29,7 +29,7 @@ The current implementation does not attempt to provide:
 - distributed caching or multi-region operation;
 - a high-availability database;
 - distributed rate limiting, quotas, or budget enforcement;
-- an administrative web API or user interface;
+- a public or multi-user administrative web service;
 - arbitrary provider URLs, credentials, or models supplied by clients;
 - semantic caching; or
 - complete translation of every provider feature, such as Anthropic tool calling.
@@ -80,8 +80,10 @@ The client controls the public model name and generation parameters. It does not
 | Measurement tools | Measure overhead, cache behavior, and load independently of the request path | `benchmarks/` |
 
 These gateway modules run in one service. The optional `dashboard/` is a separate
-localhost-only process that reads existing SQLite usage; it cannot manage keys or
-serve as a public administrator interface. `client_testing/` exercises the gateway
+localhost-only process for recorded usage, key administration and verified
+maintenance. Its session-protected `/admin/` endpoints reuse CLI operations; writes
+require an exact Origin, a request token and bounded JSON input. This local trust
+boundary does not provide multi-user administrator authentication. `client_testing/` exercises the gateway
 without requiring a separate end-user app.
 
 ## 5. Request-processing flow
@@ -278,14 +280,16 @@ A request is eligible only when it is non-streaming and either:
 
 `"cache": false` always opts out. The gateway-only field is removed before provider translation.
 
-Anthropic settings are validated before cache lookup. Unsupported fields, including
-`temperature`, return 400 instead of being dropped. Use explicit `cache: true` for
-Anthropic caching, or `cache: false` for fresh results.
+Anthropic settings are validated before cache lookup. Sampling fields are rejected
+by default, but an explicit administrator policy can remove selected fields first.
+Eligibility uses the effective settings: a removed temperature cannot enable caching.
+See [parameter policy](docs/parameter-policy.md). Use `cache: true` for explicit reuse
+or `cache: false` for fresh results.
 
 The cache key is:
 
 ```text
-SHA-256(virtual_key_id + canonical request JSON without the cache field)
+SHA-256(virtual_key_id + canonical JSON of policy version, provider, upstream model and effective body)
 ```
 
 Including the virtual-key ID prevents one application from receiving another application's stored response. Canonical JSON makes object-key ordering irrelevant while preserving meaningful values and array ordering. Only successful complete responses are stored, and lookups ignore an entry after its 30-minute reuse window.

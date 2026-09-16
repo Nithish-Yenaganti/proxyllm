@@ -21,7 +21,9 @@ successful responses per second, and successful latency percentiles. Repeat runs
 overwrite that report unless you supply `--output`. This is a paced stability
 check, not a saturation benchmark: offered traffic is approximately clients/3
 requests per second, with synchronized client bursts. It includes localhost HTTP
-and Uvicorn but excludes TLS, real provider delays, and streaming. No production
+and Uvicorn but excludes TLS and real provider delays; streaming is off by default.
+Use `--stream` for first-content timing, `--cache-every` for a synthetic cache mix,
+and `--interval` to change pacing. No production
 capacity or sustained maximum can be inferred from a successful run.
 
 ## Free isolated load experiment
@@ -44,6 +46,8 @@ real-provider performance. It excludes Uvicorn, TCP, TLS, and streaming behavior
 Use `--levels 1 4 8 --requests-per-client 10 --output PATH` to customize the run.
 
 ## Checks against your running proxy
+
+For the complete, repeatable two-provider sequence, use the [demo guide](../docs/demo.md).
 
 Run the following checks from the repository root with the virtual environment activated and
 the proxy running. These scripts do not start the server or issue keys.
@@ -106,8 +110,9 @@ python -m client_testing.latency --requests 5 --warmups 1 --output benchmarks/re
 python -m client_testing.cache_benchmark --unique-prompts 2 --repeats 2 --output benchmarks/results/client-cache.json
 ```
 
-Start with these small workloads and an idle key. Large/default cache workloads
-can exceed 24 requests in 60 seconds; throttled runs are not clean cache or
-capacity measurements. Use the existing mock provider for unpaid experiments.
+Start with these small workloads and an idle key. The scripts now pause three
+seconds between pairs or cache requests by default. Lowering `--pair-pause` or
+`--request-pause`, or sharing the key with other traffic, can trigger rate limiting;
+throttled runs are not clean latency/cache measurements. Use mocks for unpaid experiments.
 These wrappers measure latency and caching, not maximum sustainable throughput.
 Do not claim benchmark results until a run succeeds and its report is inspected.

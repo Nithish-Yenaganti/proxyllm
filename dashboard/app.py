@@ -9,6 +9,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from auth.database import DATABASE_PATH
+from auth.backup import BACKUP_DIRECTORY
+from dashboard.management import management_router
 
 
 def snapshot(path):
@@ -37,9 +39,11 @@ def snapshot(path):
     return {'totals': totals, 'keys': keys, 'recent': recent}
 
 
-def create_app(path=DATABASE_PATH):
+def create_app(path=DATABASE_PATH, backup_directory=BACKUP_DIRECTORY):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     token = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
+    app.include_router(management_router(path, backup_directory))
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]'])
 
     @app.middleware('http')
@@ -51,14 +55,30 @@ def create_app(path=DATABASE_PATH):
         origin = request.headers.get('origin')
         if origin and origin != str(request.base_url).rstrip('/'):
             return JSONResponse({'error': 'Origin denied'}, status_code=403)
-        if request.url.path == '/data' and not secrets.compare_digest(request.cookies.get('dashboard_session', ''), token):
+        if (request.url.path in {'/data', '/session'} or request.url.path.startswith('/admin/')) and not secrets.compare_digest(request.cookies.get('dashboard_session', ''), token):
             return JSONResponse({'error': 'Open the dashboard first'}, status_code=401)
-        response = await call_next(request)
+        if request.url.path.startswith('/admin/'):
+            if request.method != 'GET':
+                if (origin != str(request.base_url).rstrip('/') or
+                        not secrets.compare_digest(request.headers.get('x-csrf-token', ''), csrf)):
+                    return JSONResponse({'error': 'Refresh the dashboard and retry.'}, status_code=403)
+                if request.headers.get('content-type', '').split(';')[0] != 'application/json':
+                    return JSONResponse({'error': 'JSON required'}, status_code=415)
+            if not Path(path).is_file():
+                return JSONResponse({'error': 'Database missing. Initialize the gateway first.'}, status_code=503)
+        try:
+            response = await call_next(request)
+        except (sqlite3.Error, OSError, ValueError, TimeoutError):
+            response = JSONResponse({'error': 'Operation failed. Check local database and backup access, then refresh before retrying.'}, status_code=503)
         response.headers['Cache-Control'] = 'no-store'
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         return response
+
+    @app.get('/session')
+    def session():
+        return {'csrf': csrf}
 
     @app.get('/')
     def index():

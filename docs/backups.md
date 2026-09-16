@@ -22,10 +22,10 @@ To check an existing snapshot:
 .venv/bin/python -m auth.backup verify --snapshot backups/EXACT-SNAPSHOT-NAME.db
 ```
 
-Hourly execution is managed separately through the local task automation. It
-depends on the host and scheduler being available; it is not a deployment server
-service or a guaranteed hourly recovery point. Use a server-native scheduler when
-deploying. Failures must be investigated rather than assumed to be successful backups.
+Automatic execution is currently disabled: the local Codex backup schedule was
+paused at the user's request. Backup commands and retention logic remain available.
+Cloning the repository does not install a scheduler. If deployment is added later,
+configure and test a server-native schedule; do not assume hourly recovery points exist.
 
 Hourly snapshots now retain the newest three plus the latest snapshot from before
 today (using the host's local date). Normally that fourth point is from yesterday;
@@ -35,7 +35,7 @@ and verifies retained snapshots before deleting anything. A failed snapshot or
 verification leaves old backups intact. Concurrent backup runs are refused by a
 directory lock (macOS/Linux). Filesystem deletion failures can leave extra copies.
 
-The hourly scheduler uses:
+To create a snapshot with hourly retention manually:
 
 ```bash
 .venv/bin/python -m auth.backup create --kind hourly

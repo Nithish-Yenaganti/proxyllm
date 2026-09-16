@@ -1,8 +1,30 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxyLLM · Overview</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
-<body><aside><div class="brand">ProxyLLM<span>LOCAL CONSOLE</span></div><a href="#overview">Overview</a><a href="#clients">Clients & permissions</a><a href="#activity">Recent activity</a><p>Read-only workspace<br>No provider calls</p></aside>
-<main id="overview"><header><div><p class="eyebrow">GATEWAY OBSERVABILITY</p><h1>Your proxy, at a glance.</h1><p>All-time recorded usage from your local database.</p></div><button id="refresh">Refresh data</button></header>
-<p id="state" role="status" aria-live="polite">Loading local records…</p><section id="metrics" aria-label="Usage totals"></section>
-<section class="panel" id="clients"><h2>Clients & permissions</h2><p>Provider access is assigned per virtual key. Secrets are never displayed.</p><div class="scroll"><table><thead><tr><th>Client / key ID</th><th>Status</th><th>Providers</th><th>Requests</th><th>Tokens</th><th>Est. USD</th></tr></thead><tbody id="keys"></tbody></table></div></section>
-<section class="panel" id="activity"><h2>Recent activity</h2><p>The latest 30 recorded requests. Times are UTC.</p><div class="scroll"><table><thead><tr><th>Time</th><th>Key ID</th><th>Provider</th><th>HTTP</th><th>Cache</th><th>Tokens</th><th>Latency</th></tr></thead><tbody id="recent"></tbody></table></div></section>
-<footer><strong>What this view does not show</strong><p>Middleware rejections, including rate limits, are not in usage logs. Missing log writes are not counted. Cache hits record zero new provider tokens; cost figures are estimates, not invoices. Database availability does not prove the gateway is online.</p></footer></main></body></html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxyLLM · Local console</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<nav aria-label="Main navigation"><a class="brand" href="#overview">ProxyLLM</a><div class="tabs"><a href="#overview" data-page="overview">Overview</a><a href="#keys" data-page="keys">Virtual keys</a><a href="#maintenance" data-page="maintenance">Maintenance</a></div><span class="local">Local console</span></nav>
+<main>
+<div class="toolbar"><span id="state" role="status" aria-live="polite">Loading local records…</span><button id="refresh" class="secondary">Refresh data</button></div>
+<section id="page-overview" class="page">
+<header><div><p class="eyebrow">YOUR GATEWAY</p><h1>Overview</h1><p>Recorded usage across your local gateway.</p></div><button id="overview-create">Create key</button></header>
+<p class="caption">All-time totals</p><section id="metrics" aria-label="Usage totals"></section>
+<section class="section"><div class="section-title"><h2>Recent activity</h2><span>Latest 30 requests · UTC</span></div><div class="scroll"><table><thead><tr><th>Time</th><th>Key ID</th><th>Provider</th><th>HTTP</th><th>Cache</th><th>Tokens</th><th>Latency</th></tr></thead><tbody id="recent"></tbody></table></div></section>
+<footer><strong>About these numbers</strong><p>Costs are estimates, not invoices. Cache hits add no provider tokens. Middleware rejections and missing log writes are excluded. This view does not indicate gateway health.</p></footer>
+</section>
+<section id="page-keys" class="page" hidden>
+<header><div><h1>Virtual keys</h1><p>Manage application access to your gateway.</p></div><button id="create-open">Create key</button></header>
+<div class="scroll section"><table><thead><tr><th>Application / ID</th><th>Status</th><th>Provider access</th><th>Actions</th></tr></thead><tbody id="keys"></tbody></table></div>
+<section class="section"><div class="section-title"><h2>Usage by key</h2><button id="export" class="secondary">Export usage JSON</button></div><label for="usage-key">Application</label><select id="usage-key"><option value="">All keys</option></select><div id="key-usage" class="usage-grid"></div></section>
+</section>
+<section id="page-maintenance" class="page" hidden>
+<header><div><h1>Maintenance</h1><p>Verified backups and expired cache cleanup.</p></div></header>
+<div class="maintenance-grid">
+<section class="panel"><h2>Database backups</h2><p>Every new snapshot is verified using a temporary restore.</p><label for="backup-kind">Backup type</label><select id="backup-kind"><option value="maintenance">Maintenance · retained</option><option value="hourly">Hourly · applies retention</option></select><p class="hint">Hourly retains the newest three snapshots and a prior-day fallback. Older hourly snapshots may be deleted. This does not enable a schedule.</p><button id="backup-create">Create backup</button><hr><label for="snapshots">Existing snapshot</label><select id="snapshots"><option value="">No snapshots loaded</option></select><button id="backup-verify" class="secondary">Verify snapshot</button><p class="hint">Verification never replaces the live database.</p></section>
+<section class="panel"><h2>Expired cache</h2><p>Preview expired entries before removing them.</p><p id="cache-count" class="cache-count">Not checked</p><button id="cache-preview" class="secondary">Preview cleanup</button><button id="cache-delete" disabled>Delete expired entries</button><p class="hint">Deletion requires confirmation and a verified backup. Cached answers are never displayed here.</p></section>
+</div>
+</section>
+</main>
+<dialog id="key-dialog" aria-labelledby="key-title"><form id="key-form"><h2 id="key-title">Create virtual key</h2><p id="key-description">Choose the application's initial provider access.</p><div id="app-field"><label for="app-name">Application name</label><input id="app-name" maxlength="100" required autocomplete="off"></div><label for="provider">Provider</label><select id="provider"><option value="anthropic">Anthropic</option><option value="fireworks">Fireworks</option></select><label for="credential">Credential</label><select id="credential"><option value="default">default</option></select><p class="hint">Uses credentials configured on the gateway. Granting access does not configure a provider.</p><p id="key-error" role="alert"></p><div class="actions"><button type="button" class="secondary" id="key-cancel">Cancel</button><button type="submit" id="key-submit">Create key</button></div></form></dialog>
+<dialog id="secret-dialog" aria-labelledby="secret-title"><h2 id="secret-title">Save your new key</h2><p>This secret is shown once. Save it before closing.</p><label for="new-secret">Virtual key</label><input id="new-secret" readonly spellcheck="false" autocomplete="off"><p id="copy-state" role="status"></p><div class="actions"><button id="copy-secret" class="secondary">Copy key</button><button id="secret-close">I've saved my key</button></div></dialog>
+<dialog id="confirm-dialog" aria-labelledby="confirm-title"><h2 id="confirm-title">Confirm action</h2><p id="confirm-message"></p><p id="confirm-error" role="alert"></p><div class="actions"><button id="confirm-cancel" class="secondary">Cancel</button><button id="confirm-action">Confirm</button></div></dialog>
+</body></html>

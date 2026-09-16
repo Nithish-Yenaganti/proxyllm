@@ -1,30 +1,70 @@
-# Local dashboard
+# Local management dashboard
 
-Run from the project root:
+Run from the repository root:
 
 ```bash
 .venv/bin/python -m dashboard.app
 ```
 
-Open http://127.0.0.1:8001 in your browser. The gateway can continue on port 8000.
-The viewer binds only to localhost, uses read-only SQLite queries, and does not
-initialize or migrate data. Create the database via normal proxy setup first.
-Use Refresh data for a new snapshot. No external assets or provider calls occur.
+Open http://127.0.0.1:8001. Initialize the gateway database first using the normal
+setup workflow. Restart an existing dashboard process after updating its Python
+code, then reload the browser.
 
-Shows all-time recorded usage, estimated spend and savings, safe key IDs and
-provider permissions, and the latest 30 ledger rows. It never selects key hashes,
-key prefixes, credentials, prompts, or cached response bodies.
+## Screens
 
-This is for a trusted single-user computer, not a public admin service. Any local
-process/user able to reach it may open the page; the session cookie is browser
-isolation, not user authentication. Host, origin, fetch-site, and loopback checks
-reduce browser cross-site exposure. Do not expose it through tunneling, port
-forwarding, or a reverse proxy. Public deployment requires real administrator
-authentication and HTTPS. There are no key-management or write endpoints.
+- **Overview:** all-time requests, provider tokens, estimated cost, cache hits,
+  estimated savings, recorded errors and the latest 30 usage records (UTC).
+- **Virtual keys:** create a key with one initial provider, show its secret once,
+  grant another supported provider, revoke access with confirmation, view usage
+  per key or across keys, and download that usage as JSON.
+- **Maintenance:** create maintenance or hourly backups, verify a selected local
+  snapshot, preview expired cache entries, and confirm backup-gated deletion.
 
-Middleware rejections and failed log writes are absent from usage totals.
-Cache hits record zero new provider tokens. Cost figures are estimates, not invoices.
-Snapshot availability is not a gateway health check. Missing database/schema
-returns an error instead of creating files. Large all-time aggregations may be
-slow as the ledger grows; this initial local viewer has no pagination beyond
-the bounded recent-activity list.
+The interface uses white and gray surfaces with blue primary buttons. Revocation
+confirmation uses red to distinguish the destructive action. Refresh is manual.
+New secrets are cleared from the form when dismissed and are never stored in
+browser storage. Losing the creation response or closing before saving means the
+secret cannot be recovered; revoke the unwanted key and create another.
+
+Provider choices are Anthropic and Fireworks with the trusted `default` credential
+reference supported by the gateway. A grant does not install an adapter or configure
+its credentials. Provider secrets, URLs, cached answers and hashes are never shown.
+Revocation retains usage history. Permission removal, key reactivation, provider
+configuration editing, gateway process management and live database restoration
+are not exposed. The CLI remains available.
+
+## Local trust boundary
+
+This is a **localhost-only administrator tool**, not a public or multi-user admin
+service. The cookie and request token provide browser isolation, not user identity;
+any process or user that can access this machine's loopback interface may obtain a
+session. Do not expose it through a tunnel or reverse proxy.
+
+All administrative endpoints require the session cookie. Writes additionally
+require an exact matching Origin, a request token in `X-CSRF-Token`, JSON content,
+and a body of at most 16 KB (actual bytes counted). Loopback, Host and cross-site
+checks remain enabled. Responses use no-store and the UI renders supplied text
+using textContent. No provider calls are made.
+
+Operations reuse CLI database/backup/cleanup helpers with explicit paths. The
+database must already exist; normal persistence helpers retain their additive
+schema initialization behavior. Backups stay in the configured backup directory;
+verification accepts existing regular snapshots, not arbitrary paths. Hourly
+backup creation applies existing retention and does not start a schedule. Cache
+cleanup recounts expired rows when executed and requires a verified backup before
+deleting any. Verification failure prevents deletion. Backup verification restores
+only into temporary storage.
+
+Usage excludes middleware rejections and missing log writes. Cost figures are
+estimates, not invoices. Cache hits record no new provider tokens. Reading the
+database does not establish that the gateway or providers are online.
+
+## Validation
+
+```bash
+.venv/bin/python -m unittest tests.test_dashboard tests.test_dashboard_management -v
+```
+
+Tests use temporary SQLite databases and backup directories. They cover key
+creation/grants/revocation, secret omission, export, access checks, input limits,
+backup verification and traversal rejection, and cleanup's backup-failure behavior.
