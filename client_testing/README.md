@@ -97,7 +97,19 @@ python -m auth.cli usage
 Run `.venv/bin/python -m client_testing.evidence_suite` from the repository root.
 This uses only temporary local mock servers, saves fresh reports, and checks
 multiple client counts, streaming timing and a mixed cache workload.
-See [the benchmark plan](../docs/benchmark-improvement-plan.md) for scope and limits.
+Reports count completed responses separately from rate rejections, busy responses,
+transport errors and incomplete streams. First-token timing measures the first
+nonempty content delta, not response headers. Each suite run creates a fresh,
+ignored directory under `benchmarks/results/` and refuses to overwrite it.
+Reports include checkout revision, dirty state, settings and timing samples;
+they omit prompts, answers and credentials.
+
+The suite uses closed-loop clients, a default 25 ms mock delay and tiny responses.
+Its synthetic cache hit rate does not predict real savings. Rate limits and the
+five provider slots remain enabled. These are repeatability checks, not capacity
+measurements. For real comparisons, keep model/settings equal, alternate direct
+and gateway calls, and pace below key limits. Small samples or negative apparent
+overhead do not establish that the proxy speeds up a provider.
 
 ## Saved benchmarks
 
@@ -116,3 +128,21 @@ seconds between pairs or cache requests by default. Lowering `--pair-pause` or
 throttled runs are not clean latency/cache measurements. Use mocks for unpaid experiments.
 These wrappers measure latency and caching, not maximum sustainable throughput.
 Do not claim benchmark results until a run succeeds and its report is inspected.
+
+## Historical mock measurement
+
+Moved from the earlier prototype notes; these results were not rerun during the
+documentation cleanup. They are separate from live-provider evidence.
+
+An isolated 8-client, 30-second localhost pooled run completed all 80 requests:
+p50 49.569 ms, p95 69.470 ms, p99 78.148 ms. The earlier non-pooled run had p50
+80.567 ms and p95 133.668 ms. These single, non-interleaved mock runs suggest a
+latency improvement, not a statistically established production speedup.
+Throughput remains approximately 2.67 successful requests/sec because the
+generator intentionally paces requests. No maximum-capacity claim is warranted.
+
+Reproduce the pooled run with:
+
+```bash
+python -m client_testing.http_load --pooled --output benchmarks/results/local-http-pooled.json
+```
