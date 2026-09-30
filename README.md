@@ -5,7 +5,7 @@ one OpenAI-compatible API**. Each application gets a virtual key; provider
 credentials stay on the gateway.
 
 Built with **FastAPI, HTTPX and SQLite**, with a plain HTML/CSS/JavaScript dashboard.
-Tested locally with mock and real providers. AWS deployment is not completed.
+Designed for a single-host deployment and tested with mock and real providers.
 
 ## What you can do
 
@@ -108,19 +108,22 @@ MOCK_PROVIDER_DELAY_MS=0 MOCK_PROVIDER_FAIL_EVERY=0 MOCK_PROVIDER_RESPONSE_TOKEN
 PROXY_DROP_SAMPLING_PARAMS='{}' .venv/bin/python -m benchmarks.inspection_demo
 ```
 
-These use temporary databases and mock providers. The inspection demo checks that
-the preview matches the actual outgoing payload. See the [live demo](docs/demo.md)
-and dated [provider results](docs/real-provider-check-results.md) for real-call evidence.
+These use temporary databases and mock providers. The inspection demo verifies
+that the preview matches the actual outgoing payload. For a repeatable local
+walkthrough covering successful requests, denied access, streaming and caching,
+run:
 
-For the presentation-ready walkthrough and interview answers, use the
-[three-minute demo guide](docs/interview-demo.md). A locally rendered recording is
-kept under the ignored `benchmarks/results/` directory so a video binary is not
-accidentally added to the source repository.
+```bash
+.venv/bin/python -m client_testing.evidence_suite
+```
+
+Reports are written under the ignored `benchmarks/results/` directory. The suite
+starts isolated mock services, uses temporary databases and makes no paid calls.
 
 ## Limits
 
-This is a local learning project, not a public production service. Keep the
-management dashboard localhost-only; it does not authenticate individual admins.
+ProxyLLM is a single-host gateway rather than a public multi-tenant service. Keep
+the management dashboard localhost-only; it does not authenticate individual admins.
 Anthropic supports text chat with a limited set of translated settings.
 Streaming bypasses the response cache. Usage costs are estimates, and middleware
 rejections are not included in usage totals. Cached answers and backups are private data.
@@ -130,8 +133,7 @@ spending budget, public TLS deployment, or off-machine disaster recovery.
 
 ## Further reading
 
-- [Project reference](PROJECT.md) — configuration, supported models and exact behavior.
-- [Architecture](ARCHITECTURE.md) · [Code guide](CODE_GUIDE.md) · [Decision history](DECISIONS.md).
+- [Architecture](ARCHITECTURE.md) — request flow, storage and deployment boundaries.
 - [Request inspection](docs/inspection.md) · [Sampling policy](docs/parameter-policy.md).
 - [Dashboard](dashboard/README.md) · [Backups](docs/backups.md) · [Cache cleanup](docs/cache-cleanup.md).
-- [Testing and benchmarks](client_testing/README.md) · [Deployment status](docs/deployment-guide.md).
+- [Testing and benchmarks](client_testing/README.md).

@@ -47,8 +47,6 @@ Use `--levels 1 4 8 --requests-per-client 10 --output PATH` to customize the run
 
 ## Checks against your running proxy
 
-For the complete, repeatable two-provider sequence, use the [demo guide](../docs/demo.md).
-
 Run the following checks from the repository root with the virtual environment activated and
 the proxy running. These scripts do not start the server or issue keys.
 Set `PROXY_VIRTUAL_KEY` in your ignored `client_testing/.env`; for isolation set a different
