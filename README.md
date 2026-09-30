@@ -109,9 +109,8 @@ PROXY_DROP_SAMPLING_PARAMS='{}' .venv/bin/python -m benchmarks.inspection_demo
 ```
 
 These use temporary databases and mock providers. The inspection demo verifies
-that the preview matches the actual outgoing payload. For a repeatable local
-walkthrough covering successful requests, denied access, streaming and caching,
-run:
+that the preview matches the actual outgoing payload. For repeatable local
+evidence covering complete requests, concurrency, streaming and caching, run:
 
 ```bash
 .venv/bin/python -m client_testing.evidence_suite
