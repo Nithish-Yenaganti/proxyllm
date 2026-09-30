@@ -3,10 +3,10 @@
 # Supplies the factory type used to inject mock HTTP clients during tests.
 from collections.abc import Callable
 
-# Sends buffered and streamed requests to the Fireworks HTTP API.
-from copy import deepcopy
+# Supplies flexible JSON dictionary annotations used during request preparation.
 from typing import Any
 
+# Sends buffered and streamed requests to the Fireworks HTTP API.
 import httpx
 import anyio
 

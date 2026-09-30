@@ -1,7 +1,6 @@
 """Small real-provider demo against an already-running local gateway (paid calls)."""
 import argparse
 import asyncio
-import json
 import os
 import uuid
 from pathlib import Path

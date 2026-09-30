@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 # Provides the web application and incoming request type.
 from fastapi import FastAPI, Request
 
-# Provides complete JSON responses and unbuffered streaming responses.
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+# Provides complete JSON responses and the shared response type.
+from fastapi.responses import JSONResponse, Response
 from providers.concurrency import GatewayBusy, ProviderSlots, SlotStreamingResponse, limited_send
 
 # Protects every /v1/* route with active virtual API keys.

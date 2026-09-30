@@ -25,7 +25,6 @@ from providers.base import (
     ProviderConnectionError,
     ProviderRequestError,
     create_http_client,
-    get_response_headers,
 )
 
 
