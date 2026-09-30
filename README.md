@@ -22,13 +22,19 @@ request limit and five simultaneous provider calls per process.
 ## How it works
 
 ```mermaid
-flowchart LR
-    Client[Application with virtual key] --> Gateway[FastAPI gateway]
-    Gateway --> Auth[(SQLite<br/>keys, permissions, usage, cache)]
-    Gateway --> Prepare[Shared request preparation]
-    Prepare --> Anthropic[Anthropic Messages API]
-    Prepare --> Fireworks[Fireworks Chat Completions API]
-    Dashboard[Local management dashboard] --> Auth
+sequenceDiagram
+    participant App as Client
+    participant Proxy as ProxyLLM
+    participant DB as SQLite
+    participant LLM as AI Provider
+
+    App->>Proxy: OpenAI-compatible request + virtual key
+    Proxy->>DB: Verify key, permission and rate limit
+    Proxy->>Proxy: Translate request for provider
+    Proxy->>LLM: Send translated request
+    LLM-->>Proxy: Response or stream
+    Proxy->>DB: Record usage / cache response
+    Proxy-->>App: OpenAI-compatible response
 ```
 
 The gateway authenticates the key, checks provider access, translates the request,
