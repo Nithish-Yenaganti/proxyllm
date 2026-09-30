@@ -6,6 +6,7 @@ from time import time
 
 from auth.backup import BACKUP_DIRECTORY, connect_readonly, create_backup
 from auth.database import DATABASE_PATH
+from auth.storage_security import prepare_private_database
 
 # Must match the gateway reuse policy; regression test checks this agreement.
 CACHE_REUSE_SECONDS = 1800
@@ -21,6 +22,7 @@ def cleanup(source=DATABASE_PATH, backup_directory=BACKUP_DIRECTORY, *, delete=F
         return count, 0
     # Failure here prevents any deletion. The live database is never restored over.
     create_backup(source, backup_directory)
+    source = prepare_private_database(source, create=False)
     # mode=rw prevents an absent source from becoming a newly created database.
     with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=rw", uri=True, timeout=10)) as db:
         with db:

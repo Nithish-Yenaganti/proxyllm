@@ -139,6 +139,7 @@ class VirtualKeyDatabaseTests(unittest.IsolatedAsyncioTestCase):
             await database.commit()
 
         # Runs the same idempotent migration used during FastAPI startup.
+        legacy_database_path.chmod(0o600)
         await initialize_database(legacy_database_path)
 
         # Looks up the automatically backfilled Fireworks permission.

@@ -8,6 +8,11 @@ from benchmarks.common import write_json_report
 from client_testing.http_load import run
 
 
+def report_passed(report):
+    """Require every attempted request to finish as a complete HTTP 200."""
+    return report['successful'] == report['attempted'] and report['statuses'] == {'200': report['attempted']}
+
+
 async def suite(output):
     output.mkdir(parents=True, exist_ok=False)
     cases = [(f'concurrency-{n}', dict(clients=n, interval=0.25)) for n in (1, 5, 10)]
@@ -19,6 +24,10 @@ async def suite(output):
         print(f"{name}: {report['successful']}/{report['attempted']} complete; "
               f"{report['successful_requests_per_second']:.2f} successful requests/s; "
               f"statuses={report['statuses']}", flush=True)
+        if not report_passed(report):
+            failures = [sample for sample in report['samples'] if sample['status'] != '200' or not sample['complete']]
+            diagnostic = sorted({(item['status'], item.get('error_code', 'unclassified')) for item in failures})
+            raise RuntimeError(f'{name} produced unsuccessful requests: {diagnostic}')
 
 
 def main():

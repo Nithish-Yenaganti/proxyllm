@@ -102,7 +102,9 @@ transport errors and incomplete streams. First-token timing measures the first
 nonempty content delta, not response headers. Each suite run creates a fresh,
 ignored directory under `benchmarks/results/` and refuses to overwrite it.
 Reports include checkout revision, dirty state, settings and timing samples;
-they omit prompts, answers and credentials.
+they omit prompts, answers and credentials. The command exits unsuccessfully as
+soon as a case contains any non-200 or incomplete response, and retains only a
+bounded stable error code for diagnosis rather than provider error text.
 
 The suite uses closed-loop clients, a default 25 ms mock delay and tiny responses.
 Its synthetic cache hit rate does not predict real savings. Rate limits and the

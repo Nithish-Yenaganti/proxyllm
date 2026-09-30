@@ -58,6 +58,16 @@ async def measure_request(client, url, headers, body):
                 if response.status_code == 200:
                     decoded = json.loads(payload)
                     result['complete'] = bool(decoded.get('choices')) and 'error' not in decoded
+                else:
+                    # Keep only the stable error code. Provider messages can contain
+                    # request details and do not belong in saved benchmark evidence.
+                    try:
+                        decoded = json.loads(payload)
+                        error = decoded.get('error', {}) if isinstance(decoded, dict) else {}
+                        if isinstance(error, dict) and isinstance(error.get('code'), str):
+                            result['error_code'] = error['code'][:128]
+                    except (ValueError, UnicodeDecodeError, RecursionError):
+                        pass
     except Exception as error:
         # Store type only: HTTP exception messages may contain private endpoint details.
         result['error_type'] = type(error).__name__

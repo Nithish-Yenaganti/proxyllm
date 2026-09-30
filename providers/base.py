@@ -75,6 +75,9 @@ class AdapterResponse:
     # Tells FastAPI whether to use Response or StreamingResponse.
     streaming: bool
 
+    # Releases an unopened or suspended stream when downstream delivery fails.
+    aclose: Callable[[], Awaitable[None]] | None = None
+
 
 # Defines the one common function signature implemented by every provider module.
 class ProviderAdapter(Protocol):

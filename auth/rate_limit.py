@@ -5,9 +5,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import aiosqlite
-
-from auth.database import DATABASE_PATH, configure_database_connection
+from auth.database import DATABASE_PATH, configure_database_connection, open_database
 
 
 # Applies the agreed rolling policy independently to each authenticated virtual key.
@@ -41,7 +39,7 @@ async def consume_rate_limit(
     observed_time = time.time() if current_time_unix is None else current_time_unix
     cutoff_time = observed_time - window_seconds
 
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         await configure_database_connection(database)
 
         # Acquires the SQLite writer lock before reading. Every worker sharing this

@@ -21,10 +21,14 @@ request limit and five simultaneous provider calls per process.
 
 ## How it works
 
-```text
-Your app → ProxyLLM → Anthropic or Fireworks
-               │
-               └── SQLite: keys, permissions, usage and response cache
+```mermaid
+flowchart LR
+    Client[Application with virtual key] --> Gateway[FastAPI gateway]
+    Gateway --> Auth[(SQLite<br/>keys, permissions, usage, cache)]
+    Gateway --> Prepare[Shared request preparation]
+    Prepare --> Anthropic[Anthropic Messages API]
+    Prepare --> Fireworks[Fireworks Chat Completions API]
+    Dashboard[Local management dashboard] --> Auth
 ```
 
 The gateway authenticates the key, checks provider access, translates the request,
@@ -39,8 +43,7 @@ Use **Python 3.11+ on macOS or Linux**. Run from the repository root.
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 cp -n .env.example .env
 ```
 
@@ -51,16 +54,19 @@ its URL. Configure only the providers you intend to use. Never commit `.env`.
 ### 2. Create an application key
 
 ```bash
-python -m auth.database
-python -m auth.cli create --app my-app --provider anthropic
+.venv/bin/python -m auth.database
+.venv/bin/python -m auth.cli create --app my-app --provider anthropic
 ```
 
 Save the virtual key shown once. It is the key your application uses.
 
+Existing databases must be private to your user before startup; see the
+[permission correction steps](docs/backups.md#database-permissions) if an older installation is rejected.
+
 ### 3. Start the gateway and dashboard
 
 ```bash
-python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+.venv/bin/python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 In another terminal, from the repository root:
@@ -106,6 +112,11 @@ These use temporary databases and mock providers. The inspection demo checks tha
 the preview matches the actual outgoing payload. See the [live demo](docs/demo.md)
 and dated [provider results](docs/real-provider-check-results.md) for real-call evidence.
 
+For the presentation-ready walkthrough and interview answers, use the
+[three-minute demo guide](docs/interview-demo.md). A locally rendered recording is
+kept under the ignored `benchmarks/results/` directory so a video binary is not
+accidentally added to the source repository.
+
 ## Limits
 
 This is a local learning project, not a public production service. Keep the
@@ -113,6 +124,9 @@ management dashboard localhost-only; it does not authenticate individual admins.
 Anthropic supports text chat with a limited set of translated settings.
 Streaming bypasses the response cache. Usage costs are estimates, and middleware
 rejections are not included in usage totals. Cached answers and backups are private data.
+SQLite and provider-call limits are process-local, so this design is not suitable
+for multi-host high availability. There is no automatic provider fallback, global
+spending budget, public TLS deployment, or off-machine disaster recovery.
 
 ## Further reading
 

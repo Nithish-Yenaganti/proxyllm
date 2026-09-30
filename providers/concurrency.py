@@ -1,5 +1,6 @@
 """Per-process bound on active upstream calls, including streamed responses."""
 import asyncio
+import anyio
 from fastapi.responses import StreamingResponse
 
 
@@ -28,24 +29,38 @@ class ProviderSlots:
 
 
 class SlotStreamingResponse(StreamingResponse):
-    def __init__(self, *args, release, **kwargs):
+    def __init__(self, *args, release, close=None, total_seconds=300,
+                 write_seconds=30, **kwargs):
         super().__init__(*args, **kwargs)
         self.release = release
-        original = self.body_iterator
-
-        async def tracked():
-            try:
-                async for chunk in original:
-                    yield chunk
-            finally:
-                release()
-        self.body_iterator = tracked()
+        self.close = close
+        self.total_seconds = total_seconds
+        self.write_seconds = write_seconds
+        self.original_iterator = self.body_iterator
 
     async def __call__(self, scope, receive, send):
+        async def bounded_send(message):
+            with anyio.fail_after(self.write_seconds):
+                await send(message)
+
         try:
-            await super().__call__(scope, receive, send)
+            with anyio.fail_after(self.total_seconds):
+                await super().__call__(scope, receive, bounded_send)
         finally:
-            self.release()
+            # A failed downstream write can leave the iterator suspended at yield.
+            # Closing it runs accounting and adapter cleanup before releasing the slot.
+            try:
+                with anyio.CancelScope(shield=True):
+                    close_iterator = getattr(self.original_iterator, "aclose", None)
+                    try:
+                        if close_iterator is not None:
+                            await close_iterator()
+                    finally:
+                        # Also covers failure while sending headers, before iteration.
+                        if self.close is not None:
+                            await self.close()
+            finally:
+                self.release()
 
 
 async def limited_send(slots, adapter, request):

@@ -11,6 +11,7 @@ class BackupTests(unittest.TestCase):
     def test_wal_snapshot_and_restore_preserve_data(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "live.db"
+            source.touch(mode=0o600)
             with closing(sqlite3.connect(source)) as db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT)")
@@ -35,6 +36,7 @@ class BackupTests(unittest.TestCase):
     def test_restore_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "live.db"
+            source.touch(mode=0o600)
             with closing(sqlite3.connect(source)) as db:
                 db.execute("CREATE TABLE records (id INTEGER)")
             with self.assertRaises(FileExistsError):
@@ -44,6 +46,7 @@ class BackupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "bad.db"
             source.write_bytes(b"not a database")
+            source.chmod(0o600)
             destination = Path(folder) / "copy.db"
             with self.assertRaises(sqlite3.DatabaseError):
                 checked_copy(source, destination)

@@ -1,14 +1,13 @@
 """Local administrative endpoints; reuse CLI operations with explicit storage paths."""
-import json
 import re
 from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from api.request_body import read_json_body, RequestTooLarge
+from api.request_body import read_json_body, RequestTooLarge, RequestBodyTimeout
 from auth.backup import create_backup, verify_restore
 from auth.cache_cleanup import cleanup
 from auth.database import (create_virtual_key_record, grant_provider_permission,
@@ -46,9 +45,11 @@ async def body(request, model):
     try:
         value = await read_json_body(request, 16384)
         return model.model_validate(value, strict=True)
+    except RequestBodyTimeout:
+        raise HTTPException(408, 'Request body did not arrive before the deadline.') from None
     except RequestTooLarge:
         raise HTTPException(413, 'Request exceeds 16 KB.') from None
-    except (ValueError, ValidationError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         # Never echo submitted content or secrets in validation responses.
         raise HTTPException(400, 'Invalid fields. Check the form and try again.') from None
 

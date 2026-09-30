@@ -14,6 +14,7 @@ class CleanupCommandTests(unittest.TestCase):
         self.assertEqual(CACHE_REUSE_SECONDS, CACHE_TTL_SECONDS)
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / 'source.db'
+            source.touch(mode=0o600)
             backups = Path(folder) / 'backups'
             with closing(sqlite3.connect(source)) as db:
                 db.execute('CREATE TABLE response_cache (id INTEGER, created_at_unix REAL, expires_at_unix REAL)')

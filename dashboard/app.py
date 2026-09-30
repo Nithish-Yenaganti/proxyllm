@@ -10,12 +10,14 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from auth.database import DATABASE_PATH
 from auth.backup import BACKUP_DIRECTORY
+from auth.storage_security import prepare_private_database
 from dashboard.management import management_router
 
 
 def snapshot(path):
     # Read-only SQLite connection: no migrations, key writes, or cache content reads.
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
+    path = prepare_private_database(path, create=False)
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN")
         totals = dict(db.execute("""SELECT COUNT(*) requests,

@@ -326,6 +326,22 @@ Important safeguards include:
 - only selected safe upstream response headers cross the gateway; and
 - errors returned to clients do not include secrets or raw internal exceptions.
 
+Request bodies have a total 30-second deadline and a byte limit. JSON validation
+rejects non-finite numbers, invalid Unicode and excessive nesting before routing;
+model names are bounded, and unknown names never enter the usage ledger.
+`SlotStreamingResponse` limits total stream time to 300 seconds and each downstream
+write to 30 seconds, closing iterators and responses before releasing capacity.
+`providers/response_limits.py` bounds decompression and SSE parsing: 5 MB for
+complete responses, 20 MB decoded SSE and 64 KiB per SSE line. Fireworks observation
+can stop independently so its forwarded SSE bytes remain unchanged.
+
+`auth/storage_security.py` checks database and sidecar ownership, file type, links
+and permissions before SQLite opens them. Creation uses exclusive mode 0600;
+existing unsafe files fail closed and require an offline operator correction.
+Runtime opens cannot recreate a missing database. Parent directories must not be
+writable by other users; same-user malicious filesystem changes are outside this
+boundary.
+
 Production deployments still need TLS termination, network access controls, budget
 quotas, distributed edge protection, secret management, database backup policy, log
 retention policy, and monitoring.
@@ -340,6 +356,8 @@ The gateway presents stable OpenAI-style JSON error envelopes. Important status 
 | `401` | Missing, malformed, unknown, or revoked virtual key |
 | `403` | Valid key without permission for the routed provider |
 | `404` | Public model is not registered |
+| `408` | Request body did not arrive before the total deadline |
+| `413` | Request body exceeds the byte limit |
 | `429` | Authenticated virtual key exhausted its rolling 60-second capacity |
 | `500` | Trusted provider or adapter configuration is missing |
 | `502` | Upstream connection or protocol failure |

@@ -2,6 +2,7 @@
 
 # Runs the asynchronous setup function when this file is used as a CLI module.
 import asyncio
+from contextlib import asynccontextmanager
 
 # Builds a reliable database path relative to this file, not the current terminal folder.
 from pathlib import Path
@@ -9,9 +10,19 @@ from pathlib import Path
 # Provides non-blocking SQLite access that works with our asynchronous FastAPI app.
 import aiosqlite
 
+from auth.storage_security import prepare_private_database
+
 
 # Stores the database beside this module as auth/gateway.db.
 DATABASE_PATH = Path(__file__).resolve().parent / "gateway.db"
+
+
+@asynccontextmanager
+async def open_database(database_path: Path):
+    """Open checked storage without recreating a missing database."""
+    path = await asyncio.to_thread(prepare_private_database, database_path, create=False)
+    async with aiosqlite.connect(path.as_uri() + "?mode=rw", uri=True) as database:
+        yield database
 
 
 # Defines the table that will hold safe virtual-key metadata and hashes.
@@ -191,8 +202,9 @@ async def add_column_if_missing(
 
 # Creates the database file and schema without returning a value.
 async def initialize_database(database_path: Path = DATABASE_PATH) -> None:
+    database_path = await asyncio.to_thread(prepare_private_database, database_path)
     # Opens the SQLite connection and closes it automatically afterward.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Applies foreign-key enforcement and a concurrency-friendly lock timeout.
         await configure_database_connection(database)
 
@@ -257,7 +269,7 @@ async def create_virtual_key_record(
     await initialize_database(database_path)
 
     # Opens a short-lived asynchronous connection for this write operation.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Inserts only metadata and the one-way hash, never the plaintext key.
         cursor = await database.execute(
             """
@@ -325,7 +337,7 @@ async def list_virtual_key_records(
     await initialize_database(database_path)
 
     # Opens a read connection for the listing operation.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Makes each SQLite row accessible by its column name.
         database.row_factory = aiosqlite.Row
 
@@ -408,7 +420,7 @@ async def get_active_virtual_key_by_hash(
     database_path: Path = DATABASE_PATH,
 ) -> dict[str, object] | None:
     # Opens a read connection for this authentication attempt.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Uses startup-created schema and waits safely around concurrent writes.
         await configure_database_connection(database)
 
@@ -461,7 +473,7 @@ async def create_usage_log_record(
     database_path: Path = DATABASE_PATH,
 ) -> int:
     # Opens one short-lived write connection for this completed request.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Waits safely when another concurrent request is writing to SQLite.
         await configure_database_connection(database)
 
@@ -526,7 +538,7 @@ async def summarize_usage(
 ) -> list[dict[str, object]]:
     """Aggregate all-time recorded usage per key, including revoked keys."""
     await initialize_database(database_path)
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         database.row_factory = aiosqlite.Row
         cursor = await database.execute(
             """
@@ -558,7 +570,7 @@ async def list_usage_log_records(
     await initialize_database(database_path)
 
     # Opens a read-only-style connection for the accounting ledger query.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Allows callers to address every result by its descriptive column name.
         database.row_factory = aiosqlite.Row
 
@@ -603,7 +615,7 @@ async def get_cached_response_record(
     database_path: Path = DATABASE_PATH,
 ) -> dict[str, object] | None:
     # Opens one short-lived read connection on the initialized application database.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Applies the same concurrency and relationship settings as request writes.
         await configure_database_connection(database)
 
@@ -656,7 +668,7 @@ async def upsert_cached_response_record(
     database_path: Path = DATABASE_PATH,
 ) -> None:
     # Opens one bounded write connection for this cacheable provider response.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Waits for concurrent usage-log writes instead of failing immediately.
         await configure_database_connection(database)
 
@@ -713,7 +725,7 @@ async def get_provider_permission_for_key(
     database_path: Path = DATABASE_PATH,
 ) -> dict[str, str] | None:
     # Opens a short-lived connection for this provider authorization check.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Uses startup-created schema and waits safely around concurrent writes.
         await configure_database_connection(database)
 
@@ -758,7 +770,7 @@ async def grant_provider_permission(
     await initialize_database(database_path)
 
     # Opens one transaction for the active-key check and permission write.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Checks that the target key exists and has not been revoked.
         key_cursor = await database.execute(
             """
@@ -819,7 +831,7 @@ async def revoke_virtual_key_record(
     await initialize_database(database_path)
 
     # Opens a write connection for the revocation operation.
-    async with aiosqlite.connect(database_path) as database:
+    async with open_database(database_path) as database:
         # Revokes only an existing key that is currently active.
         cursor = await database.execute(
             """

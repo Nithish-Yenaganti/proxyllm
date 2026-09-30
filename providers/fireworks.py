@@ -10,6 +10,8 @@ from typing import Any
 import httpx
 import anyio
 
+from providers.response_limits import read_bounded_response
+
 # Supplies the shared adapter contract, response container, and network helpers.
 from providers.base import (
     AdapterRequest,
@@ -53,6 +55,7 @@ class FireworksAdapter:
         provider_headers = {
             "Authorization": f"Bearer {request.credential.api_key}",
             "Content-Type": "application/json",
+            "Accept-Encoding": "gzip, deflate",
         }
         stream_requested = provider_body.get("stream") is True
 
@@ -63,11 +66,18 @@ class FireworksAdapter:
                 # Converts network failures into a provider-independent gateway error.
                 try:
                     # Sends the translated body and waits for the complete response.
-                    provider_response = await provider_client.post(
-                        request.credential.url,
-                        headers=provider_headers,
-                        json=provider_body,
+                    provider_http_request = provider_client.build_request(
+                        "POST", request.credential.url,
+                        headers=provider_headers, json=provider_body,
                     )
+                    provider_response = await provider_client.send(
+                        provider_http_request, stream=True,
+                    )
+                    try:
+                        response_body = await read_bounded_response(provider_response)
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            await provider_response.aclose()
 
                 # Handles DNS, TLS, connection, and timeout failures from HTTPX.
                 except httpx.RequestError as error:
@@ -78,7 +88,7 @@ class FireworksAdapter:
             return AdapterResponse(
                 status_code=provider_response.status_code,
                 headers=get_response_headers(provider_response),
-                body=provider_response.content,
+                body=response_body,
                 streaming=False,
             )
 
@@ -118,7 +128,7 @@ class FireworksAdapter:
         if provider_response.is_error:
             # Buffers only the error response so it can be returned as normal JSON.
             try:
-                error_body = await provider_response.aread()
+                error_body = await read_bounded_response(provider_response)
             except httpx.RequestError as error:
                 raise ProviderConnectionError from error
             finally:
@@ -137,10 +147,16 @@ class FireworksAdapter:
                 streaming=False,
             )
 
+        async def close_stream():
+            with anyio.CancelScope(shield=True):
+                await provider_response.aclose()
+                await provider_client.aclose()
+
         # Returns a lazy body iterator so FastAPI can transmit each SSE chunk immediately.
         return AdapterResponse(
             status_code=provider_response.status_code,
             headers=get_response_headers(provider_response, raw_body=True),
             body=forward_raw_stream(request, provider_response, provider_client),
             streaming=True,
+            aclose=close_stream,
         )

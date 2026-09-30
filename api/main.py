@@ -30,7 +30,8 @@ from providers.concurrency import GatewayBusy, ProviderSlots, SlotStreamingRespo
 
 # Protects every /v1/* route with active virtual API keys.
 from api.middleware import VirtualKeyAuthMiddleware
-from api.request_body import RequestTooLarge, configured_body_limit, read_json_body
+from api.request_body import (RequestTooLarge, RequestBodyTimeout, configured_body_limit,
+                              configured_body_timeout, read_json_body)
 
 # Supplies database initialization, authorization lookups, and usage persistence.
 from auth.database import (
@@ -72,6 +73,8 @@ from usage.tracking import (
 # Loads .env values into process memory without displaying or logging their contents.
 load_dotenv()
 PARAMETER_DROP_POLICY = load_drop_policy(os.getenv("PROXY_DROP_SAMPLING_PARAMS", "{}"), MODEL_ROUTES)
+MAX_MODEL_NAME_LENGTH = 256
+REQUEST_BODY_TIMEOUT_SECONDS = configured_body_timeout(os.getenv("PROXY_REQUEST_BODY_TIMEOUT_SECONDS", "30"))
 MAX_REQUEST_BYTES = configured_body_limit(os.getenv("PROXY_MAX_REQUEST_BYTES", "5000000"))
 
 
@@ -351,7 +354,15 @@ async def chat_completions(request: Request):
     # Parses the OpenAI-compatible request body before model routing begins.
     try:
         # Converts incoming UTF-8 JSON into ordinary Python values.
-        body = await read_json_body(request, MAX_REQUEST_BYTES)
+        body = await read_json_body(request, MAX_REQUEST_BYTES, REQUEST_BODY_TIMEOUT_SECONDS)
+
+    except RequestBodyTimeout:
+        return await reject(
+            virtual_key_id=virtual_key_id, provider=None, model=None,
+            model_route=None, started_at=started_at, status="invalid_request",
+            status_code=408, message="Request body did not arrive before the deadline.",
+            error_type="invalid_request_error", code="request_body_timeout",
+        )
 
     except RequestTooLarge:
         return await reject(
@@ -363,7 +374,7 @@ async def chat_completions(request: Request):
         )
 
     # Handles malformed JSON without exposing an internal FastAPI exception.
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, RecursionError):
         return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
@@ -396,7 +407,8 @@ async def chat_completions(request: Request):
     requested_model = body.get("model")
 
     # Requires one non-empty model name before consulting the explicit registry.
-    if not isinstance(requested_model, str) or requested_model == "":
+    if (not isinstance(requested_model, str) or not requested_model
+            or len(requested_model) > MAX_MODEL_NAME_LENGTH):
         return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
@@ -405,7 +417,7 @@ async def chat_completions(request: Request):
             started_at=started_at,
             status="invalid_request",
             status_code=400,
-            message="The model field must be a non-empty string.",
+            message=f"The model field must be a string of 1 to {MAX_MODEL_NAME_LENGTH} characters.",
             error_type="invalid_request_error",
             code="invalid_model",
         )
@@ -418,12 +430,12 @@ async def chat_completions(request: Request):
         return await reject(
             virtual_key_id=virtual_key_id,
             provider=None,
-            model=requested_model,
+            model=None,
             model_route=None,
             started_at=started_at,
             status="model_not_found",
             status_code=404,
-            message=f"The model {requested_model!r} is not configured.",
+            message="The requested model is not configured.",
             error_type="invalid_request_error",
             code="model_not_found",
         )
@@ -784,6 +796,7 @@ async def chat_completions(request: Request):
             status_code=adapter_response.status_code,
             headers=adapter_response.headers,
             release=release_slot,
+            close=adapter_response.aclose,
         )
 
     # Extracts normalized token totals from the complete provider response body.

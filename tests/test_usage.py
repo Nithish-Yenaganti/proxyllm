@@ -280,6 +280,7 @@ class UsageDatabaseTests(unittest.IsolatedAsyncioTestCase):
             await database.commit()
 
         # Runs the same idempotent migration used by the real FastAPI lifespan.
+        legacy_path.chmod(0o600)
         await initialize_database(legacy_path)
 
         # Reads the upgraded column names directly from SQLite metadata.

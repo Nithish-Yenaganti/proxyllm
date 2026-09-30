@@ -16,6 +16,8 @@ from typing import Any
 import httpx
 import anyio
 
+from providers.response_limits import read_bounded_response, bounded_sse_lines
+
 # Supplies the shared adapter contract, errors, containers, and HTTP helpers.
 from providers.base import (
     AdapterRequest,
@@ -124,6 +126,8 @@ def translate_anthropic_request(request: AdapterRequest) -> dict[str, Any]:
 
         # Reads the role used to determine Anthropic's target field.
         role = message.get("role")
+        if not isinstance(role, str):
+            raise ProviderRequestError("Every message role must be a string.")
 
         # Converts supported text content while rejecting lossy translations.
         content = extract_text_content(message.get("content"))
@@ -140,7 +144,7 @@ def translate_anthropic_request(request: AdapterRequest) -> dict[str, Any]:
         if role not in {"user", "assistant"}:
             # Rejects tool and custom roles that require a richer translation layer.
             raise ProviderRequestError(
-                f"Anthropic routing does not support the message role {role!r}."
+                "Anthropic routing supports only system, developer, user, and assistant roles."
             )
 
         # Adds the translated conversation turn to the provider request.
@@ -389,8 +393,8 @@ async def translate_anthropic_stream(
 
     # Guarantees upstream cleanup after completion, error, cancellation, or disconnect.
     try:
-        # Reads complete SSE lines while allowing HTTPX to decode content compression.
-        async for line in provider_response.aiter_lines():
+        # Decodes bounded chunks and limits each SSE line before JSON parsing.
+        async for line in bounded_sse_lines(provider_response):
             # Stops processing as soon as the downstream application disconnects.
             if await request.is_disconnected():
                 # Leaves iteration so the finally block releases both resources.
@@ -415,7 +419,7 @@ async def translate_anthropic_stream(
                 event = json.loads(serialized_event)
 
             # Handles malformed provider SSE without leaking raw event data.
-            except json.JSONDecodeError:
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 # Emits one normalized error before ending this broken stream.
                 yield encode_openai_sse(
                     {
@@ -588,6 +592,7 @@ class AnthropicAdapter:
             "x-api-key": request.credential.api_key,
             "anthropic-version": ANTHROPIC_API_VERSION,
             "Content-Type": "application/json",
+            "Accept-Encoding": "gzip, deflate",
         }
 
         # Selects streaming from the already-normalized provider body.
@@ -600,11 +605,18 @@ class AnthropicAdapter:
                 # Converts provider network failures into a gateway-level exception.
                 try:
                     # Sends the translated Messages request and waits for all JSON.
-                    provider_response = await provider_client.post(
-                        request.credential.url,
-                        headers=provider_headers,
-                        json=provider_body,
+                    provider_http_request = provider_client.build_request(
+                        "POST", request.credential.url,
+                        headers=provider_headers, json=provider_body,
                     )
+                    provider_response = await provider_client.send(
+                        provider_http_request, stream=True,
+                    )
+                    try:
+                        response_body = await read_bounded_response(provider_response)
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            await provider_response.aclose()
 
                 # Handles DNS, TLS, connection, and timeout failures from HTTPX.
                 except httpx.RequestError as error:
@@ -614,10 +626,10 @@ class AnthropicAdapter:
             # Parses the provider JSON after the complete response has arrived.
             try:
                 # Reads the documented Message or error object.
-                response_json = provider_response.json()
+                response_json = json.loads(response_body)
 
             # Handles a provider response that claims JSON but contains invalid data.
-            except json.JSONDecodeError as error:
+            except (ValueError, UnicodeDecodeError, RecursionError) as error:
                 # Converts the unexpected upstream schema into a gateway 502.
                 raise ProviderConnectionError from error
 
@@ -687,7 +699,7 @@ class AnthropicAdapter:
         if provider_response.is_error:
             # Buffers only the small error body rather than a successful generation.
             try:
-                error_body = await provider_response.aread()
+                error_body = await read_bounded_response(provider_response)
             except httpx.RequestError as error:
                 raise ProviderConnectionError from error
             finally:
@@ -719,6 +731,11 @@ class AnthropicAdapter:
                 streaming=False,
             )
 
+        async def close_stream():
+            with anyio.CancelScope(shield=True):
+                await provider_response.aclose()
+                await provider_client.aclose()
+
         # Returns a lazy translator that emits OpenAI-compatible SSE events.
         return AdapterResponse(
             status_code=provider_response.status_code,
@@ -735,4 +752,5 @@ class AnthropicAdapter:
                 provider_client,
             ),
             streaming=True,
+            aclose=close_stream,
         )

@@ -15,12 +15,20 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+*.log
+*.pid
 
 # Local benchmark evidence can contain machine, endpoint, and workload details
-benchmarks/results/*.json
-benchmarks/results/**/*.json
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+.demo-build/
 
 # Packaging and build output
 build/
@@ -35,11 +43,20 @@ dist/
 # Local databases
 backups/
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
 *.sqlite
+*.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite3
+*.sqlite3-journal
 *.sqlite3-shm
 *.sqlite3-wal
+
+# Local certificates and private-key material
+*.pem
+*.key
+*.p12
+*.pfx

@@ -13,12 +13,14 @@ import time
 from uuid import uuid4
 
 from auth.database import DATABASE_PATH
+from auth.storage_security import prepare_private_database
 
 BACKUP_DIRECTORY = DATABASE_PATH.parent.parent / "backups"
 
 
 def connect_readonly(path):
-    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    path = prepare_private_database(path, create=False)
+    return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
 
 
 def checked_copy(source, destination):

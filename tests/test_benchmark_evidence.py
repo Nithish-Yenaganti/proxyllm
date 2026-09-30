@@ -36,6 +36,15 @@ class EvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['status'], str(status))
             self.assertFalse(result['complete'])
 
+    async def test_error_code_is_recorded_without_provider_message(self):
+        result = await self.measure(
+            '{"error":{"code":"gateway_busy","message":"private detail"}}',
+            status=503,
+            stream=False,
+        )
+        self.assertEqual(result['error_code'], 'gateway_busy')
+        self.assertNotIn('private detail', str(result))
+
     def test_provenance(self):
         result = provenance()
         self.assertIn('commit', result)

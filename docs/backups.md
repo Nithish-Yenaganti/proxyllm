@@ -55,3 +55,28 @@ revisit this for large datasets. The SQLite copy has a sixty-second progress dea
 Actual disaster recovery (stopping the server, selecting a known-good snapshot,
 preserving the damaged database, replacing it, and restarting) remains a separate,
 explicit operator action; this command only tests restoration safely.
+
+## Database permissions
+
+New gateway databases use mode `0600`, including SQLite's WAL and shared-memory
+sidecars. Gateway, dashboard and maintenance opens reject existing database or
+sidecar files that other users can access, as well as symlinks, hardlinks and files
+owned by another user. The containing directory must belong to your user and must
+not be writable by other users.
+
+For an older installation rejected because of file permissions, stop all gateway
+and dashboard processes first. From the repository root, correct the existing
+files without creating missing sidecars:
+
+```bash
+chmod 600 auth/gateway.db
+for path in auth/gateway.db-wal auth/gateway.db-shm auth/gateway.db-journal; do
+  if [ -f "$path" ]; then chmod 600 "$path"; fi
+done
+```
+
+Use these commands only for your own regular files; a symlink, hardlink, ownership
+or directory error needs separate investigation. Restart after the correction.
+Backups with unsafe permissions are rejected too; correct the specific snapshot
+only after checking ownership. The application does not change existing file
+permissions for you, and this change does not erase any earlier exposure.

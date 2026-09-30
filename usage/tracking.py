@@ -15,8 +15,6 @@ from decimal import Decimal
 # Parses complete response JSON and OpenAI-compatible SSE data events.
 import json
 
-# Incrementally decodes compressed Fireworks streams for observation only.
-import zlib
 
 
 # Represents one provider response's normalized token counters.
@@ -104,7 +102,7 @@ def extract_token_usage_from_body(body: bytes) -> TokenUsage:
         return extract_token_usage(json.loads(body))
 
     # Treats provider errors and malformed successful bodies as unknown usage.
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         # Keeps observability failure from changing the client-visible response.
         return TokenUsage()
 
@@ -135,61 +133,34 @@ def estimate_cost_usd(
 
 # Incrementally reads usage events while leaving streamed bytes unchanged for the client.
 class OpenAIStreamObserver:
-    # Configures optional decompression based on the forwarded Content-Encoding header.
     def __init__(self, content_encoding: str | None = None) -> None:
-        # Holds incomplete SSE lines split across arbitrary network chunks.
-        self.buffer = b""
-
-        # Exposes the final facts used when the stream closes.
+        from providers.response_limits import BoundedDecoder, BoundedLines
+        from providers.base import ProviderConnectionError
+        self.lines = BoundedLines()
         self.observation = StreamObservation(usage=TokenUsage())
-
-        # Normalizes the optional encoding name for matching.
-        normalized_encoding = (content_encoding or "").lower()
-
-        # Creates a gzip decoder that observes a copy while original bytes pass through.
-        if normalized_encoding == "gzip":
-            # Uses the gzip wrapper mode required by HTTP Content-Encoding.
-            self.decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-
-        # Creates a standard zlib decoder for deflate-encoded response streams.
-        elif normalized_encoding == "deflate":
-            # Uses zlib's default wrapped DEFLATE format.
-            self.decompressor = zlib.decompressobj()
-
-        # Leaves uncompressed and unsupported encodings untouched.
-        else:
-            # None tells feed() that chunks already contain readable SSE bytes.
-            self.decompressor = None
-
-    # Observes one raw network chunk without buffering or changing downstream output.
-    def feed(self, chunk: bytes) -> None:
-        # Attempts to decode a compressed observation copy when necessary.
+        self.disabled = False
         try:
-            # Keeps ordinary SSE bytes unchanged for parsing.
-            decoded_chunk = (
-                self.decompressor.decompress(chunk)
-                if self.decompressor is not None
-                else chunk
-            )
+            self.decoder = BoundedDecoder(content_encoding)
+        except ProviderConnectionError:
+            self.disabled = True
 
-        # Ignores malformed compression metadata rather than breaking the response.
-        except zlib.error:
-            # Clears pending parser data because it can no longer form valid events.
-            self.buffer = b""
+    @property
+    def buffer(self):
+        return self.lines.buffer
 
-            # Stops observing this unusable chunk.
+    def feed(self, chunk: bytes) -> None:
+        from providers.base import ProviderConnectionError
+        if self.disabled:
             return
-
-        # Adds only the small unprocessed tail to this newly decoded chunk.
-        self.buffer += decoded_chunk
-
-        # Extracts every complete SSE line now available.
-        while b"\n" in self.buffer:
-            # Keeps any incomplete final line for the next network chunk.
-            line, self.buffer = self.buffer.split(b"\n", 1)
-
-            # Parses this complete line independently of SSE chunk boundaries.
-            self._observe_line(line.rstrip(b"\r"))
+        try:
+            for decoded in self.decoder.feed(chunk):
+                for line in self.lines.feed(decoded):
+                    self._observe_line(line)
+        except ProviderConnectionError:
+            self.lines.buffer = b""
+            self.decoder = None
+            self.disabled = True
+            self.observation.completed = False
 
     # Updates stream facts from one complete OpenAI-compatible SSE line.
     def _observe_line(self, line: bytes) -> None:
@@ -215,7 +186,7 @@ class OpenAIStreamObserver:
             event = json.loads(serialized_payload)
 
         # Ignores invalid or non-UTF-8 diagnostic events safely.
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             # Continues observing later stream events.
             return
 
@@ -231,7 +202,7 @@ class OpenAIStreamObserver:
 
 
 # Passes stream chunks through immediately and writes one log when iteration ends.
-async def observe_stream(
+async def _observe_stream(
     body: AsyncIterator[bytes],
     observer: OpenAIStreamObserver,
     on_finished: Callable[[StreamObservation, bool], Awaitable[None]],
@@ -259,6 +230,14 @@ async def observe_stream(
 
     # Runs after normal completion, provider failure, or downstream cancellation.
     finally:
+        import anyio
+        close_body = getattr(body, "aclose", None)
+        if close_body is not None:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await close_body()
+                except Exception:
+                    stream_failed = True
         # Starts a separate task so cancellation cannot skip the final SQLite insert.
         logging_task = asyncio.create_task(
             on_finished(observer.observation, stream_failed)
@@ -273,3 +252,43 @@ async def observe_stream(
         except asyncio.CancelledError:
             # The independently scheduled database operation continues in the event loop.
             pass
+
+
+class ObservedStream:
+    """Finalize usage even if sending response headers fails before iteration."""
+    def __init__(self, body, observer, on_finished):
+        self.body = body
+        self.observer = observer
+        self.on_finished = on_finished
+        self.iterator = _observe_stream(body, observer, on_finished)
+        self.started = False
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.closed:
+            raise StopAsyncIteration
+        self.started = True
+        return await self.iterator.__anext__()
+
+    async def aclose(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.started:
+            await self.iterator.aclose()
+            return
+        import anyio
+        with anyio.CancelScope(shield=True):
+            try:
+                close_body = getattr(self.body, "aclose", None)
+                if close_body is not None:
+                    await close_body()
+            finally:
+                await self.on_finished(self.observer.observation, True)
+
+
+def observe_stream(body, observer, on_finished):
+    return ObservedStream(body, observer, on_finished)

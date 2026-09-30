@@ -14,6 +14,7 @@ import httpx
 from benchmarks.cache_workload import run_workload
 from benchmarks.common import percentile, summarize_latencies
 from benchmarks.load_sweep import find_ceiling, parse_levels
+from client_testing.evidence_suite import report_passed
 
 
 # Returns deterministic cache outcomes without opening an HTTP connection.
@@ -65,6 +66,12 @@ class FakeGatewayClient:
 
 # Exercises the shared statistics used by the latency benchmark.
 class BenchmarkMathTests(unittest.TestCase):
+    def test_evidence_suite_requires_every_request_to_succeed(self) -> None:
+        healthy = {'attempted': 3, 'successful': 3, 'statuses': {'200': 3}}
+        failed = {'attempted': 3, 'successful': 2, 'statuses': {'200': 2, '500': 1}}
+        self.assertTrue(report_passed(healthy))
+        self.assertFalse(report_passed(failed))
+
     # Confirms interpolated percentiles work for small deterministic samples.
     def test_percentiles_and_latency_summary(self) -> None:
         # Uses a deliberately unsorted sample to prove the helper sorts a copy.
