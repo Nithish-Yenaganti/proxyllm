@@ -495,8 +495,3 @@ To add another provider without breaking the architecture:
 7. Test complete responses, streaming, errors, cleanup, usage accounting, and authorization denial.
 
 Provider fallback should be introduced only with an explicit policy for model equivalence, retries, duplicate billing, latency budgets, and streaming failures.
-
-## 15. Related decision record
-
-The historical rationale for the measurement and cache implementation is recorded in
-[`docs/adr/0001-phase-5-measurement-and-cache.md`](docs/adr/0001-phase-5-measurement-and-cache.md).

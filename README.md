@@ -19,7 +19,24 @@ Designed for a single-host deployment and tested with mock and real providers.
 The gateway enforces 24 requests per key per rolling minute, a default 5 MB
 request limit and five simultaneous provider calls per process.
 
-## How it works
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[OpenAI-compatible client] --> Gateway[FastAPI gateway]
+    Dashboard[Local dashboard] --> Database[(SQLite)]
+    Gateway <-->|keys, permissions, cache, usage| Database
+    Gateway --> Adapters[Provider adapters]
+    Adapters --> Anthropic[Anthropic API]
+    Adapters --> Fireworks[Fireworks API]
+```
+
+The gateway and dashboard share one local SQLite database. Provider adapters keep
+upstream credentials and protocol differences behind the gateway boundary. See
+[architecture](ARCHITECTURE.md) for component responsibilities, security boundaries
+and design tradeoffs.
+
+## Runtime flow
 
 ```mermaid
 sequenceDiagram
@@ -38,8 +55,7 @@ sequenceDiagram
 ```
 
 The gateway authenticates the key, checks provider access, translates the request,
-and returns an OpenAI-shaped response. The dashboard manages the same local data.
-See [architecture](ARCHITECTURE.md) for the request flow and design tradeoffs.
+calls the selected provider and returns an OpenAI-shaped response.
 
 ## Run locally
 
